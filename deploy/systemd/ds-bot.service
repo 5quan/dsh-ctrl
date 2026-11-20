@@ -1,0 +1,18 @@
+[Unit]
+Description=DS-Bot (DeepSeek Harness Web + ds-bot plugin)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/bot-resource-lab-20261117/work/dsbot
+Environment=DSH_HOME=/opt/bot-resource-lab-20261117/data/dsbot
+Environment=DSH_TELEMETRY_DISABLED=1
+Environment=PATH=/opt/bot-resource-lab-20261117/runtime/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/opt/bot-resource-lab-20261117/runtime/bin/dsh web --host 127.0.0.1 --port 13080 --no-open
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
