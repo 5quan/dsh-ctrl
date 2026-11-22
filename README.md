@@ -26,16 +26,18 @@ dsh-ctrl/
 │   └── systemd/
 │       └── ds-bot.service  # 宿主机常驻服务配置（监听 127.0.0.1:13080）
 └── docs/
-    ├── HANDOFF.md          # 当前进度、服务器现场状态与交接文档
+    ├── ARCHITECTURE.md     # 项目总说明书、目标架构、设计抉择（ADR）与分期路线图
     ├── SPEC.md             # 开发流程规范（Issue → 认领 → 开发）与技术约束
+    ├── HANDOFF.md          # 当前进度、本地环境现场与交接文档
     ├── KNOWN_ISSUES.md     # 已知问题与排查记录
-    ├── list.txt            # 原始规划清单
-    └── note.txt            # 后续演进备忘
+    └── IDEAS.md            # 未来演进灵感备忘
 ```
 
 ## 快速入口
 
-- 交接与环境现场：[docs/HANDOFF.md](docs/HANDOFF.md)
+- **项目总说明书与目标架构**：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - 开发流程与技术 Spec：[docs/SPEC.md](docs/SPEC.md)
+- 交接与环境现场：[docs/HANDOFF.md](docs/HANDOFF.md)
 - 已知问题记录：[docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)
+- 未来演进灵感备忘：[docs/IDEAS.md](docs/IDEAS.md)
 - 当前核心 Epic：[`5quan/dsh-ctrl#2`](https://github.com/5quan/dsh-ctrl/issues/2)
