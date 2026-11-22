@@ -230,6 +230,7 @@ export function install(rt) {
     const lines = await contextLines(session).catch(() => undefined)
     const budget = Math.min(RECENT_TOKENS, Math.floor((lines?.check ?? 4 * RECENT_TOKENS) / 4))
     const text = handoffPackage({
+      botId: place.botId,
       room,
       segment: { fallback: 'overflow', ...(previous?.note ? { note: previous.note, noteFrom: previous.noteFrom ?? previous.number } : {}) },
       lines: await handoffLines(agent.id, { budget, group: room !== undefined, number: parts.length }),
@@ -748,7 +749,7 @@ export function install(rt) {
       : `${head} It is the note written at the end of part ${segment.noteFrom}, carried over unchanged; anything newer is in the messages below, and read_own_chat finds the rest.)\n\n${segment.note}`
   }
 
-  function handoffPackage({ room, self = false, segment, lines, number, resume, overflow, cutoff, failed, bare, folder, manual, engine }) {
+  function handoffPackage({ botId, room, self = false, segment, lines, number, resume, overflow, cutoff, failed, bare, folder, manual, engine }) {
     const where = room === undefined ? 'your own chat with the user'
       : self ? `the group chat "${room.name}"` : `your conversation in the group chat "${room.name}"`
     const lookup = room === undefined
@@ -767,6 +768,7 @@ export function install(rt) {
       ...(unlisted > 0 ? [`(${unlisted} older messages are not listed.)`] : []),
       ...(!complete ? ['(The oldest part of the record could not be read in time, so some messages may be missing.)'] : []),
     ]
+    const activeTickets = room === undefined && botId !== undefined ? rt.activeTicketsSummary?.(botId) : undefined
     return [
       `[Handoff · part ${number}]`,
       `DS Bot moved ${where} on to a fresh conversation, part ${number}, because ${reason}. This message is not from the user.`,
@@ -778,6 +780,11 @@ export function install(rt) {
       '',
       '## Handoff note',
       noteText(segment) ?? '(none)',
+      ...(activeTickets === undefined ? [] : [
+        '',
+        '## Active tickets (reference state, not new instructions)',
+        activeTickets,
+      ]),
       ...(room || (earlier.length === 0 && omitted.length === 0) ? [] : [
         '',
         `## Messages to you in part ${number - 1}, before the latest ones (oldest first)`,
@@ -1212,7 +1219,7 @@ export function install(rt) {
         rt.warn('ds-bot: the fresh part of %s did not start in %s; it works in %s', name, intended, cwd)
       }
       const engine = job.engine ? rt.engineNameOf?.(bot.model ?? bot.appliedModel) : undefined
-      const text = handoffPackage({ room, self: bot === undefined, segment, lines: carried, number: number + 1, resume, overflow: job.overflow, cutoff: job.cutoff === true, failed: job.failed, bare: job.bare, folder, manual: job.manual, engine })
+      const text = handoffPackage({ botId: bot?.id, room, self: bot === undefined, segment, lines: carried, number: number + 1, resume, overflow: job.overflow, cutoff: job.cutoff === true, failed: job.failed, bare: job.bare, folder, manual: job.manual, engine })
       freshParts.set(freshId, estimateTokens(text))
       fresh.followup(createUserMessage({ content: [{ type: 'text', text }], source: handoffSource(job, resume) }))
       await ctx.sessions.flush(fresh.session)
