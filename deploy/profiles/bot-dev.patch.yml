@@ -1,0 +1,18 @@
+# 示例配置：Windows 本地 `bot-dev` Profile 双插件联调（dsh-ctrl + dsh-memory）
+#
+# 1. 挂载两个本地平级插件到独立调试 Profile `bot-dev`：
+#    dsh plugin --profile bot-dev add link:D:/project/dsh-plguin/dsh-ctrl/ds-bot
+#    dsh plugin --profile bot-dev add link:D:/project/dsh-plguin/dsh-memory
+#
+# 2. 将下方配置合并到 `C:\Users\<user>\.dsh\profiles\bot-dev\cordis.patch.yml`：
+#    - 关闭 `ds-bot` 原生 `memory` 与 `learning`，由独立平级插件 `dsh-memory` 统一接管记忆与避坑沉淀。
+#
+# 3. 红线警告：
+#    - 严禁在 `$DSH_HOME/cordis.patch.yml`（home patch）写入 `llm-pi-ai` 或 `agent-default-model`，
+#      否则 DSH 会锁定设置并拒绝客户端通过 `settings/mutate` 保存模型与 API Key。
+#    - 不要修改日常使用的 `desktop` Profile（`~/.dsh/profiles/desktop`）。
+
+- id: bot
+  config:
+    memory: false
+    learning: false

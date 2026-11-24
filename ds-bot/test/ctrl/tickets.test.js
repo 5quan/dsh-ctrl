@@ -3,9 +3,9 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { createRuntime } from '../index.js'
-import { createTicketStore, formatActiveTicketsSummary, isValidTransition } from '../src/host/tickets.js'
-import { fakeContext } from './fake-ctx.js'
+import { createRuntime } from '../../index.js'
+import { createTicketStore, formatActiveTicketsSummary, isValidTransition } from '../../src/host/ctrl/tickets.js'
+import { fakeContext } from '../fake-ctx.js'
 
 const TEAM = {
   version: 1,
@@ -62,7 +62,7 @@ test('ticket store persists CRUD, enforces state transitions and optimistic lock
     waitingOn: 'external_event',
     wakeCondition: 'CI webhook build.passed',
     deadline: '2026-12-01T12:00:00.000Z',
-    artifacts: ['ds-bot/src/host/tickets.js'],
+    artifacts: ['ds-bot/src/host/ctrl/tickets.js'],
   })
   assert.match(created.id, /^tkt-[0-9a-f]{8}$/)
   assert.equal(created.status, 'open')
@@ -71,7 +71,7 @@ test('ticket store persists CRUD, enforces state transitions and optimistic lock
   assert.equal(created.waitingOn, 'external_event')
   assert.equal(created.wakeCondition, 'CI webhook build.passed')
   assert.equal(created.deadline, dueAt)
-  assert.deepEqual(created.artifacts, ['ds-bot/src/host/tickets.js'])
+  assert.deepEqual(created.artifacts, ['ds-bot/src/host/ctrl/tickets.js'])
   assert.equal(store1.listDue(dueAt - 1).length, 0)
   assert.deepEqual(store1.listDue(dueAt).map(tkt => tkt.id), [created.id])
 

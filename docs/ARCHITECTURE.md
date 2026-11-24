@@ -1,186 +1,137 @@
 # 项目总说明书、目标架构与设计抉择
 
-> 本文档是 `dsh-ctrl` 的长期指引文档，记录**项目定位、关于记忆/上下文/任务三大系统的核心思考与最终拍板、目标架构图、设计抉择（ADR）以及分期落地顺序**。后续开新 Issue 或调整方向时，均以本文档为基准对照。
+> 本文档是 `dsh-ctrl` 的长期指引文档，记录**三层平级拓扑、记忆与避坑边界、模糊会话机制、任务与一次性 Worker 编排、设计抉择（ADR）以及分期落地顺序**。后续开新 Issue 或调整方向时，均以本文档为基准对照。
 
 ---
 
-## 一、项目终极目标与角色定位
+## 一、三层平级拓扑与角色定位
 
-打造一个**像真人秘书一样能持续跟进事务、无需手动切换会话、拥有清晰记忆、能主动提醒和安排工作**的个人助理 Agent：
+### 1. 三层平级结构（单向依赖，独立发布）
 
-- **角色收敛（先双角色，后加工作群）**：
-  1. **秘书（`Chief`，主 Bot）**：唯一面向你的日常交互窗口——听你交代事情、记账、安排任务、做日结与晨报、跟进提醒，**不亲自干耗时的脏活累活**。
-  2. **实施者（`Worker`）**：负责真正动手执行具体任务（写代码、搜资料、改配置、查日志），干完交回结果即退出，不污染秘书上下文。
-  3. **工作群（远期追加）**：等多角色单主干跑顺后，再按需引入多员工协作群聊。
-- **开发策略**：App 只是交互与同步窗口；优先在 Windows 本地把 `ds-bot` 后端插件打磨扎实，且**每次只专注攻克一个子系统（先独立做好按日期的记忆系统）**，避免多个系统混在一起带来思想负担。
+`dsh-memory` 与 `dsh-ctrl`（定制 `ds-bot`）并非父子关系，而是**平级挂载在同一个 DSH（Cordis 插件总线）上的两个独立插件**：
 
----
+```text
+                ┌──────────────────────────────────────┐
+                │        DSH Core (Cordis 运行时)       │
+                │  session/event · systemPrompt ·      │
+                │  agent/pre-step · tools · llm        │
+                └──────────┬──────────────────┬────────┘
+                           │                  │
+            ┌──────────────▼───┐          ┌───▼──────────────────────────┐
+            │    dsh-memory    │◄─────────┤     dsh-ctrl (定制 ds-bot)   │
+            │  独立记忆插件     │  单向消费 │ 模糊会话 · Ticket · Worker   │
+            │  (记忆 + 避坑)   │  服务与事件│ Mandate 拦截 · 事件路由 · UI │
+            └──────────────────┘          └──────────────────────────────┘
+```
 
-## 二、关于记忆系统的思考：应该想起什么？
+- **`dsh-memory`（记忆与避坑底座）**：保持零 `ds-bot` 依赖，可在原版 DSH 开箱独立运行；对外仅暴露公开 Cordis 服务 `dshMemory`（`contractVersion: 1`）与标准事件 `dsh-memory/day-rolled-over`。
+- **`dsh-ctrl`（本仓库，助理外壳与编排引擎）**：默认在 Profile 中关闭 `ds-bot` 原生 `memory: false`（同步关闭 `learning.js`），主动绑定并单向消费 `dshMemory` 服务与日结事件。
 
-### 1. 核心思考：秘书到底应该记住哪些东西？
-1. **身份与偏好（个人档案）**：你是谁、做事风格、沟通偏好（例如“先说结论再说过程”）、固定环境信息。
-2. **历史与决策（发生过什么）**：之前发生的事情、做过的决定、关键思考过程与结论。
-3. **补充的三块关键拼图（仅靠“档案 + 时间”记不住的内容）**：
-   - **实体档案（Entity Cards）**：人、项目、客户、服务器、常用工具的稳定事实——提到名字或别名就应该立刻想起，不能因为过了 7 天就忘掉。
-   - **经验与避坑手册（Playbooks / Lessons）**：尤其是**你纠正过的地方**（“不对/别这样/我说过…”）和**任务失败踩过的坑**，供实施者在干同类活时避坑。
-   - **时效与准入边界（防记忆越攒越脏）**：有时效的信息要能自动过期；模型自动抽取的记忆不能直接永久生效，必须先进入候选池，经用户确认或多次印证后再晋升常驻。
+### 2. 核心角色收敛（先双角色，后按需扩展工作群）
 
-> **核心边界**：**任务进度不是记忆**。“做到哪了、卡在谁”永远归任务系统（Ticket）管；记忆系统只管“人、事、偏好、经验、过去发生了什么”。
-
-### 2. 六条设计原则
-1. **原文不可变，其余皆派生**：所有原始消息、工具输出、事件只追加不修改；日报、画像、档案都是派生品，坏了可以随时重建。
-2. **按“怎么被取出来”分层**：常驻注入 / 条件触发 / 按需检索，三种取法决定三类存储。
-3. **写入宽松，晋升严格**：候选记忆可以宽松记录，进入常驻层必须经确认（如晨报确认）或多次印证。
-4. **每条记忆有出处和时间**：带原文锚点；新事实**取代（supersede）**旧事实并保留历史，而不是直接覆盖。
-5. **确定性召回优先，语义检索兜底**：按状态、实体别名、日期、标签精确拉取，比指望模型自己想起来去搜可靠得多。
-6. **每层有 Token 预算，避免“摘要的摘要”**：绝不滚动重写周摘要（防止传话游戏失真），超预算按规则降级。
-
-### 3. 最终拍板方案：按“日期 + 空闲切日”的分层记忆
-
-| 取法层级 | 包含内容 | 对应“1 / 7 / 长期”直觉 | 存储与生命周期 |
-|---|---|---|---|
-| **常驻注入**（每轮/每日开场带入） | **核心画像**（身份/偏好/规矩）+ **近 N 天日报**（昨天全文，前 2~7 天只取标题与决定） | **长期** + **1 天 / 7 天**（窗口天数可调） | `MEMORY.md`（≤2k tokens）+ `journals/YYYY-MM-DD.md`（每日一份，生成后不可变） |
-| **条件触发**（命中才注入） | **实体档案**（人/项目/服务器）+ **岗位手册**（避坑经验） | 跨时间稳定召回 | Markdown 卡片 / `[[topic]]` + 标签/别名精确匹配 |
-| **按需检索**（工具调用） | **原文档案** + 全部历史日报 | 跨月/跨年精确回查 | 沿用 `ds-bot` 现有 `chat-index.sqlite`（FTS5）+ 原文锚点 |
-
-- **跨天重置与空闲切日策略（核心创新）**：
-  - 不在零点硬切打断深夜对话，而是**按空闲状态区分“昨天”与“今天”**——例如：**过了凌晨 `02:00` 且连续空闲超过 30 分钟**（可配置），后台自动触发“昨日记忆日结”：
-    1. 扫描昨日原文，派生一份结构化不可变日报 `journals/YYYY-MM-DD.md`（包含：发生了什么、做出的决定、新建/变更的 Ticket、**你纠正过我的地方**、悬而未决的问题、提到的实体）；
-    2. 将新抽取的偏好/教训写入 `candidate` 候选池（次日晨报向你确认后才晋升常驻）；
-    3. 秘书自动切换到干净的新一天会话（当天内若聊得太长超水位，照常 `compact` 兜底）。
-- **为什么这样彻底解决了“跨月对话变傻”**：秘书每天都以一张干净、低 Token、高信噪比的桌子上班，彻底告别无限拉长一条 Session 带来的上下文腐烂。
+1. **秘书（`Chief`，主 Bot）**：唯一面向用户的长期交互窗口——听交代、立项建单、发晨报、做关键汇报与审批确认，**不亲自干耗时脏活累活**。
+2. **实施者（`Worker`，一次性执行单元）**：面向单条 Ticket 拉起的隔离临时 Session，按 Mandate 与验收标准动手改代码/查资料/跑命令，写回 `artifacts` 与结构化报告后即销毁，不污染 `Chief` 上下文。
+3. **工作群（远期 Phase 5 按需启用）**：上游 `ds-bot` 自带的 `roster / groups / goals` 暂冻结不动，待单主干跑稳后再决定启用或裁剪。
 
 ---
 
-## 三、关于上下文的思考：现在要干什么？
+## 二、记忆与避坑边界（外置 `dsh-memory`，零重复建设）
 
-### 1. 核心思考：这一刻推理需要看什么？
-1. **历史记忆与部分历史上下文**：长期画像、近 N 天日报、刚刚聊过的相关上下文。
-2. **任务列表**：当前未关闭的活跃 Ticket、今日到期提醒。
-3. **正在发生和讨论的事情**：当下这一轮的真实对话、刚提到的实体档案与必要工具反馈。
+### 1. 明确边界划分
 
-### 2. 最终拍板方案：双轨上下文装配 + 大输出落盘
-
-- **为什么不能对秘书做“每步重建”**：如果秘书每轮都重写前面的 prompt，会打碎模型 Prompt Prefix Cache（成本和延迟暴涨 5~10 倍）并丢失实时聊天连贯性。
-- **最终双轨策略**：
-  1. **秘书（面向人，保连贯 & 吃缓存）**：
-     - 每天开启新会话时按固定顺序与预算装配：
-       1. 系统规则 + 核心画像 `MEMORY.md`（冻结前缀，≤2k）
-       2. 未关闭 Ticket 摘要 + 今日到期提醒（按状态拉取，≤2k）
-       3. 近期高频/刚提到的实体档案（别名命中，≤2k）
-       4. 近 N 天日报（昨天全文 + 更早仅标题与决定，≤3k）
-       5. 今日实时对话（原文；当天内超限走 `compact` 兜底，绝不塞海量工具日志）
-     - 需要查更早细节时，调 `read_own_chat` / `recall` 按需回查原文锚点。
-  2. **实施者（面向任务，每次唤醒干净重建）**：
-     - 不带秘书的闲聊历史；每次唤醒只装配：**Mandate + Ticket 状态 + 按标签命中的岗位避坑手册 + 相关实体档案 + 上次产物句柄**。
-     - 单次执行内吃满缓存，跑完写回 Ticket 即销毁退出。
-  3. **抗噪声底线（工具大输出落盘）**：
-     - 超过阈值的命令日志、文件内容、网页抓取直接落盘，上下文中仅保留简短摘要与句柄（如 `artifact://...`），需要时按需翻页读取。
-
----
-
-## 四、关于任务系统的思考：怎么设计这个任务系统？
-
-### 1. 核心四个问题的思考与拍板
-
-| 问题 | 思考要点 | 最终拍板方案 |
+| 归属领域 | 负责方 | 说明 |
 |---|---|---|
-| **如何记录** | 不能靠模型记忆或零散聊天记录追踪，重启和换天都不能丢 | 独立 SQLite 账本 `<home>/tickets.sqlite`（已于 Issue #3 落地）：记录 `goal`、`mandate`（授权边界）、`acceptance`（验收标准）、`status`、`owner`、`next_step`、`waiting_on`、`wake_condition`、`deadline`、`blockers`、`artifacts` 与 `revision` 乐观锁 |
-| **如何实施** | 长期存活的 Worker 会话迟早膨胀变傻；且并发修改会冲突 | **Ticket 长期持久，实施者用完即弃**：每个 Ticket 配一条串行事件队列（Actor 互斥 + `revision` 防覆盖）；每次拉起干净的实施者推进当前阶段，结果与失败原因写回 Ticket 后立即退出；高风险操作由 `tools/pre-execute` 按 Mandate 硬拦截 |
-| **如何验收** | 实施者自报完成不可靠，且不是所有标准都能靠代码判断 | **分层验收**：① 机器可判定（测试/文件/接口状态码）→ 脚本核对；② 主观质量判断 → 独立干净会话评审；③ 业务/高风险决策 → Ticket 进入 `waiting_user` 等你拍板 |
-| **如何通知** | 不能事无巨细刷屏，也不能静默卡死 | **静默执行 + 关键节点通知**：日常推进不打扰你；仅在 **完成 / 失败 / 超预算 / 需要审批（`waiting_user`）/ Deadline 超时** 时唤醒秘书，通过对话消息、`show_view` 交互卡片或 `notice` 推送给你；日常早间通过**晨报**集中汇报待办与记忆确认 |
-| **如何完善事件体系** | 外部事件和定时提醒如果直接全量灌给模型，会制造大量噪声 | **确定性事件路由 + 显式订阅**：Ticket 显式声明 `waiting_on`、`wake_condition`、`deadline`；外部事件/定时巡检/超时信号先由确定性代码去重过滤，命中活跃 Ticket 后直接进入该 Ticket 串行队列唤醒实施者，未命中或需人类拍板的才交秘书 |
+| **记忆系统与避坑经验** | **`5quan/dsh-memory`**（M1–M5 已完成） | 统一承担：原文归档（`archive.sqlite` + FTS5）、时间轴不可变日报（`journals/`）、核心画像（`PROFILE.md`）、实体档案（`entities/`）、**程序性避坑经验 / 教训卡片（`lessons/` / Playbooks）**、OpenViking 历史总览（L0/L1/L2）、统一缓冲区与晨报汇总（`buffer/` + `briefing`）、自动纠偏捕获（`correction`）以及 M4 Dream 后台自维护与回滚。 |
+| **可执行技能与工具挂载** | **DSH / `dsh-ctrl` 执行层** | 工具声明、MCP 挂载、`capabilities` / `SKILL.md` 能力配置属于执行手脚，留在本仓执行层管理。 |
+| **原生旧记忆与旧学习轮询** | **静音（后期删除）** | 通过 Profile 配置 `memory: false`（自动同时关闭 `ds-bot` 原生 `memory*.js` 与 `learning.js`），避免双记忆前缀、双确认卡片与重复烧 Token。 |
+
+> **核心铁律**：**任务进度不进记忆**。“做到哪了、卡在谁、截止日期、授权范围”永远归 `dsh-ctrl` 的 `tickets.sqlite` 管；“人、事、偏好、历史决定、实体档案、踩过的坑”永远归 `dsh-memory` 管。
+
+### 2. `dsh-ctrl` 对接契约（规划 `ctrl/memory-bridge.js`）
+
+- 订阅 `dsh-memory/day-rolled-over`：驱动 `Chief` 在空闲时无缝执行轻量日结换段；
+- 消费 `dshMemory.getMorningBriefing()` / `confirmBufferItems()` / `markBriefingDelivered()`：将记忆待确认项与到期/待审 Ticket 合并成**单张交互晨报卡片**，并通知 `dsh-memory` 已投递避免当日双推；
+- 消费 `dshMemory.matchEntities()` 与 `dshMemory.matchLessons()`：为一次性 Worker 精准装配相关实体卡与历史避坑约束；
+- Ticket 终态复盘反哺：工单进入 `done` / `failed` 时，抽取避坑教训或新环境事实调用 `dshMemory.submitBufferCandidate(...)` 投递进缓冲区等待确认。
 
 ---
 
-## 五、目标架构图（三条生命周期解耦）
+## 三、模糊会话概念（Blurred Session：单窗口永续对话流）
 
-### 1. 记忆分层与空闲日结流程
+用户视角中**永远只有 `Chief` 这一个不断线的聊天窗口**，没有“手动开新会话”“上下文满了自己重开”的概念：
+
+- **底层无缝换段（`parts.js`）**：按上下文压力（Checkpoint / 换 Part）、工作目录切换、溢出抢救或**空闲切日**静默切换底层 DSH Session，未处理消息自动转发，定时任务自动随新 Part 迁移，用户侧历史可无缝上翻读取旧 Part。
+- **日结轻量换段（`dayRollover` 陷阱规避）**：原版 `rt.newPart()` 会调 LLM 生成 8 段式交接笔记并搬运最多 16k tokens 的旧对话。接入 `dsh-memory` 后，冻结前缀已自动注入 `PROFILE.md + 昨日完整日报 + 近 N 天精华`，因此日结换段必须走**轻量 `dayRollover` 模式**——跳过 `writeNote` 与昨日原文重复搬运，仅携带 `## Active tickets` 与当前活跃态摘要，新一天零噪声上岗。
+- **抗噪声底线（`artifact://` 大输出落盘）**：超过阈值的命令日志、文件内容、网页抓取自动落盘为本地文件句柄（`ctrl/artifacts.js`），对话上下文中只保留简短摘要与 `artifact://` 句柄，防止单日对话被海量日志撑爆。
+
+---
+
+## 四、任务编排、一次性 Worker 与事件通知（参考 DeepSeek Super-agent）
+
+结合 DeepSeek Super-agent 设计探索（`dsh-superagent-prototype`）与本仓已落地的 `tickets.sqlite`，任务与编排遵循以下工程模型：
+
+| 问题 | 设计拍板（融合 `dsh-superagent` 原则） |
+|---|---|
+| **第一原则：省人类注意力** | Worker 执行全程**静默**，不把中间过程刷进 `Chief` 对话流；只在 **完成（`done`）/ 失败（`failed`）/ 需要决策（`waiting_user`）/ 等待验收（`review`）/ 超时** 时打扰人；每次需拍板尽量以**单张结构化交互卡片（`show_view` / `ask_user`）**呈现，不把问题埋在长报告里。 |
+| **如何记录：`Ticket` vs `Assignment`** | 1. **`Ticket`（已于 `#3` 落地 `tickets.sqlite` v2）**：持久化业务工单（`goal`、`mandate`、`acceptance`、`status`、`waiting_on`、`wake_condition`、`deadline`、`artifacts`、`revision` 乐观锁）；<br>2. **`Assignment` + `Effects`（待落地）**：把长期工单与**单次派工（`pending → running → ended`）**拆开；派工、回调、通知遵循 **Stored Work（先落库，事务提交后再执行，带退避重试与重启恢复）**，解决进程重启丢队列与半截状态问题。 |
+| **如何执行：隔离一次性 Worker** | 为单条 Ticket 配**串行队列（Actor 互斥 + `revision` 校验）**与全局**并发槽**（额外预留 1 个**人类优先槽**防止后台任务堵死人机对话）；每次通过 `ctx.sessionController.create` 拉起隔离临时 Session（`worker-<ticketId>`，**不写入 `state.bots` 污染侧栏名册**，并带子会话标识使 `dsh-memory` 的 `subagentPolicy: 'user-only'` 自动过滤其工具噪声），干净装配 `Ticket + Mandate + Acceptance + 命中的实体/避坑卡片 + artifact 句柄`，执行完毕由结构化 `ticket_report` 工具写回结果后销毁（**严禁从自由文本推断 `waiting_user`**）。 |
+| **如何防越权与防卡死** | 1. **`tools/pre-execute` Mandate 硬拦截（`ctrl/mandate-guard.js`）**：按结构化授权边界拦截高风险/越权工具调用，触发时强制转 `waiting_user`；<br>2. **隐藏 Worker 审批接管**：扩展 `approvals.js` 拦截 `worker-<ticketId>` 的 `approval/request` 并转发到 `Chief` / 手机通知，避免隐藏 Session 弹框无人可见而永久挂死；<br>3. **步数与费用熔断**：单次 Assignment 设步数/Token 上限，并按 Ticket 归因统计用量。 |
+| **如何验收** | **分层验收**：① 机器可判定（测试/命令/文件存在）→ 自动校验；② 主观质量 → 独立干净评审；③ 业务/高风险拍板 → `waiting_user` / `review` 卡片交人确认。 |
+| **如何驱动外部事件** | 借鉴 `Source → Trigger → Gate → Ticket`：**确定性事件路由器（`ctrl/event-router.js`）**对 IM/邮件/定时巡检/Deadline 超时（`tickets.listDue()`）先做代码去重与规则过滤，命中活跃 Ticket 的 `wake_condition` 直接投递该 Ticket 串行队列推进，仅未命中或需要人类拍板的交 `Chief`。 |
+
+---
+
+## 五、目标架构与核心数据流
 
 ```mermaid
 flowchart TB
-    subgraph Always["常驻注入（每日新会话装配）"]
-        P["核心画像 Profile<br/>MEMORY.md (≤2k)"]
-        W["工作集<br/>今日对话 + 近 N 天日报<br/>+ 未关闭 Ticket + 今日提醒"]
-    end
-    subgraph Triggered["条件触发（命中才注入）"]
-        E["实体档案 Entity Cards<br/>人 / 项目 / 服务器别名命中"]
-        L["岗位手册 Playbooks<br/>按角色 + 标签推给实施者"]
-    end
-    subgraph Searched["按需检索（工具回查）"]
-        J["不可变日报 Journals<br/>journals/YYYY-MM-DD.md"]
-        R["原文档案 Raw Archive<br/>chat-index.sqlite (FTS5)"]
+    U["用户 (Web / 手机 dsh-Go / IM)"] <-->|"单一连续模糊会话"| CHIEF["Chief 秘书 (单入口 + 轻量 dayRollover)"]
+
+    subgraph MEM["平级插件: dsh-memory (独立发布)"]
+        DM["档案 PROFILE / 日报 journals / 实体 entities / 避坑 lessons / 缓冲区"]
     end
 
-    R -->|"空闲切日 (如 02:00 后空闲 ≥30m)"| J
-    J -->|"昨日全文 + 前 2~7 天标题/决定"| W
-    R -->|"抽取候选 → 晨报确认"| P
-    R -->|"抽取候选 → 晨报确认"| E
-    R -->|"Ticket 成功/失败复盘 → 确认"| L
-```
+    CHIEF <-->|"dshMemory 服务 & day-rolled-over"| BRIDGE["ctrl/memory-bridge.js + briefing.js"]
+    BRIDGE -->|"只读召回 / 晨报聚合 / 复盘投递"| DM
 
-### 2. Ticket 生命周期状态机
+    CHIEF -->|"立项 / 调整"| TKT[("tickets.sqlite\nTickets + Assignments + Effects")]
+    EVT["外部事件 (IM / Mail) & Deadline 巡检"] --> ER["ctrl/event-router.js\n去重 + 确定性规则路由"]
+    ER -->|"命中活跃 Ticket"| Q["单 Ticket 串行队列 + 并发槽"]
+    CHIEF -->|"派发执行"| Q
 
-```mermaid
-stateDiagram-v2
-    [*] --> open: 秘书立项 (Goal / Mandate / Acceptance)
-    open --> in_progress: 派发一次性实施者
-    in_progress --> waiting_user: 需要人类拍板/审批
-    in_progress --> blocked: 等外部事件 / 时间 / 依赖 Ticket
-    waiting_user --> in_progress: 用户回复/批准
-    blocked --> in_progress: 事件到达或 deadline 超时唤醒
-    in_progress --> review: 实施者提交产物自报完成
-    review --> in_progress: 验收不通过（附原因）
-    review --> done: 验收通过
-    in_progress --> failed: 超预算 / 不可恢复错误
-    open --> cancelled: 秘书取消
-    in_progress --> cancelled: 秘书取消
-    waiting_user --> cancelled: 秘书取消
-    blocked --> cancelled: 秘书取消
-    review --> cancelled: 秘书取消
-    done --> [*]: 成功复盘 -> 候选记忆
-    failed --> [*]: 失败复盘 -> 避坑候选
-    cancelled --> [*]
-```
-
-### 3. 实施者单次运行与事件驱动循环
-
-```mermaid
-flowchart TD
-    U[用户与秘书 Chief 对话] -->|创建/调整工单| T[(tickets.sqlite)]
-    E[外部事件 / 定时巡检 / Deadline 超时] --> R[确定性事件路由器<br/>去重 + 规则过滤]
-    R -->|命中活跃 Ticket| Q[单 Ticket 串行队列<br/>Actor 互斥 + Revision 锁]
-    U -->|派发执行| Q
-    Q --> W[拉起一次性实施者<br/>Ticket + 命中手册 + 实体档案]
-    W --> G{Mandate 硬拦截 & 预算检查}
-    G -->|越权 / 需审批| A[发审批卡片 -> waiting_user]
-    G -->|允许| X[执行工具<br/>大输出落盘为 artifact 句柄]
-    X --> WB[写回 Ticket 状态 / next_step / artifacts]
-    WB --> EXIT[实施者退出销毁]
-    WB -->|完成 / 失败 / 需决策| N[唤醒秘书通知用户]
+    Q --> W["一次性隔离 Worker\nworker-ticketId (干净装配)"]
+    BRIDGE -.->|"命中实体卡与避坑经验"| W
+    W --> GUARD{"Mandate 硬拦截\ntools/pre-execute & approvals 接管"}
+    GUARD -->|"越权 / 需审批"| CARD["waiting_user 审批卡片"] --> CHIEF
+    GUARD -->|"允许执行"| EXEC["执行工具 & 大输出落盘 artifact://"]
+    EXEC -->|"结构化 ticket_report"| TKT
+    TKT -->|"done / failed / review / 阻塞"| CHIEF
+    TKT -.->|"终态复盘抽取经验"| BRIDGE
 ```
 
 ---
 
 ## 六、关键架构抉择汇总（ADR）
 
-1. **ADR-1（底座选择）**：以 `ds-bot` 为底座嫁接 DeepSeek Super-agent 与 OpenDot 的核心机制，不从零重写，也不直接拿 POSIX 强耦合的原型当底座。
-2. **ADR-2（防跨月退化）**：采用**秘书每日空闲切日重置 + 不可变日报拼接 + 实施者用完即弃**，从根源消除跨月上下文腐烂，同时在单日/单次运行内保持前缀稳定吃满 Prefix Cache。
-3. **ADR-3（单点突破，拒绝混做）**：先独立做好**按日期的记忆系统（M1）**，再做实施者闭环，最后再做工作群与复杂事件接入，降低开发与认知负担。
-4. **ADR-4（记忆防污染）**：候选池 + 晨报确认 + 纠正/失败双驱动写入 + 取代而非覆盖 + 原文锚点回查。
-5. **ADR-5（防越权与防假完成）**：Mandate 落到 `tools/pre-execute` 工具层硬拦截，验收区分机器/独立评审/人类审批。
+1. **ADR-1（底座选择）**：以 `ds-bot` 为外壳底座（复用其 Part 引擎、审批通道、Web/App/IM/浏览器/邮箱/本地 Agent 设施），严禁修改 `node_modules/@deepseek-ai/dsh` 核心源码。
+2. **ADR-2（单向依赖与外置记忆）**：记忆系统与避坑经验统一放在平级独立插件 `dsh-memory`；`dsh-ctrl` 通过 `dshMemory` 服务与 `dsh-memory/day-rolled-over` 单向消费，`dsh-memory` 永不反向引入 `ds-bot`。
+3. **ADR-3（模糊会话保缓存）**：单日内通过冻结前缀 + 增量注入保住 Prompt Prefix Cache；跨日由空闲日结事件驱动轻量 `dayRollover` 换段，既消除跨月上下文腐烂，又避免重做 LLM 交接摘要。
+4. **ADR-4（Worker 用完即弃与持久队列）**：Ticket 长期持久、Assignment 与 Worker 临时隔离；副作用先写库再执行（Stored Work），严格通过结构化工具报告状态，不为自然语言猜测状态机。
+5. **ADR-5（硬授权与低打扰通知）**：高风险操作在 `tools/pre-execute` 硬拦截、隐藏 Worker 审批由宿主接管；执行过程默认静默，仅在完成/失败/需决策时用结构化卡片唤醒 `Chief`。
+6. **ADR-6（先隔离、后精简）**：上游 `ds-bot` 模块（如群聊 `roomOf`）横跨近 30 个文件，过早强删会陷入大面积重构泥潭。因此先将所有自研代码集中隔离在 `ds-bot/src/host/ctrl/`（与 `test/ctrl/`、`client/ctrl/`），上游文件仅保留极薄钩子并用配置静音（`memory: false`），待核心秘书与 Worker 闭环跑稳后，再按实测使用清单一次性精准删除无用上游模块。
 
 ---
 
-## 七、分期落地路线图（按减负优先级排序）
+## 七、分期落地路线图
+
+> 详细逐项拆解与验收标准见 [ROADMAP.md](ROADMAP.md)。
 
 | 阶段 | 模块 | 核心交付 | 状态 |
 |---|---|---|---|
 | **Phase 0** | 本地基线 | Windows 本地开发与单测环境（`dsh@0.2.2-rc.5` + `bot-dev` `link:` 挂载） | ✅ 已完成 |
-| **Phase 1** | 任务底座（[`#3`](https://github.com/5quan/dsh-ctrl/issues/3)） | `tickets.sqlite` v2 状态机 + 4 个工单工具 + 权限隐私隔离 + 换段摘要注入 | ✅ 开发测通（`feat/3-tickets` 待合并） |
-| **Phase 2（当前优先）** | **按日期记忆系统（M1）** | **空闲切日判定**（如 `02:00` 后空闲 ≥30m）+ **日终不可变日报** `journals/YYYY-MM-DD.md` + **新一天会话自动拼接近 N 天日报 + 活跃 Ticket** | ⏳ 下一期立刻启动 |
-| **Phase 3** | 记忆进阶（M2–M3） | 实体档案别名触发、候选记忆池、用户纠正检测与晨报一键确认 | ⏳ 规划中 |
-| **Phase 4** | 实施者闭环 | 一次性实施者派发、工具大输出落盘句柄、单 Ticket 串行队列、Mandate 硬拦截 | ⏳ 规划中 |
-| **Phase 5** | 事件体系与维护 | Deadline 超时唤醒、外部事件路由、岗位避坑手册（失败复盘）、周维护与记忆回归评估 | ⏳ 规划中 |
-| **Phase 6** | 扩展形态 | 追加工作群、Cloudflare 隧道（家机部署）、精简 App 插件化 | ⏳ 远期 |
+| **Phase 1** | 任务底座 & 隔离整理（[`#3`](https://github.com/5quan/dsh-ctrl/issues/3)） | `tickets.sqlite` v2 状态机 + 4 个工单工具 + 换段摘要注入；`ctrl/` 目录隔离与文档/`deploy/` 校准 | ✅ 已完成 |
+| **外部平级** | **`dsh-memory`（M1–M5）** | 原文归档、空闲切日不可变日报、缓冲区、OpenViking L0/L1/L2、实体卡、冷启动、晨报、自动纠偏、M4 Dream 整理与回滚、M5 避坑经验 `lessons/`（`matchLessons`）及公开 Cordis 服务契约 | ✅ 已在 `5quan/dsh-memory` 完成 |
+| **Phase 2（P0）** | **记忆对接与模糊切日** | `ctrl/memory-bridge.js`（事件订阅/实体与避坑召回/终态复盘投递）+ `ctrl/day-rollover.js`（`parts.js` 轻量 `dayRollover` 换段）+ `ctrl/briefing.js`（统一晨报去重卡片） | ✅ 已完成 |
+| **Phase 3（当前优先）** | **一次性 Worker 闭环（P1 核心）** | `assignments` + `effects` 持久表、`ctrl/ticket-queue.js`（串行队列+并发槽）、`ctrl/worker-executor.js`（隔离临时 Session + 结构化 `ticket_report` + 分层验收）、`ctrl/artifacts.js`（大输出落盘）、`ctrl/mandate-guard.js`（硬拦截）与 `approvals.js` 隐藏审批接管 | ⏳ 下一期优先启动 |
+| **Phase 4** | **主动唤醒与事件路由（P2）** | `ctrl/event-router.js`（确定性去重与规则路由）、`tickets.listDue()` Deadline/卡死巡检、接通邮箱/IM 作为触发源 | ⏳ 规划中 |
+| **Phase 5** | **前端整合、大瘦身与常驻部署（P3）** | `client/ctrl/` 改造记忆面板接 `dshMemory` + 极简“待我处理”面板、按 Ticket 归因统计用量、**集中删减确认不用的 `ds-bot` 上游代码**、家机常驻 + Cloudflare Tunnel + `dsh-Go`/IM 接入；按需评估多员工工作群 | ⏳ 远期 |
