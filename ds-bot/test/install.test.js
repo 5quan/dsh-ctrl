@@ -67,6 +67,8 @@ test('apply registers listeners and effects in a fixed order', (t) => {
     'effect ds-bot: group step lines',
     'on llm/stream',
     'effect ds-bot: tickets',
+    'effect ds-bot: ticket queue',
+    'on tools/post-execute',
     'on dsh-memory/day-rolled-over',
     'on agent/status',
     'on agent/pre-step',

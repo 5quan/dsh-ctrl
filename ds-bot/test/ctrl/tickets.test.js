@@ -2,9 +2,16 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { test } from 'node:test'
 import { createRuntime } from '../../index.js'
-import { createTicketStore, formatActiveTicketsSummary, isValidTransition } from '../../src/host/ctrl/tickets.js'
+import {
+  ASSIGNMENT_STATUSES,
+  createTicketStore,
+  EFFECT_STATUSES,
+  formatActiveTicketsSummary,
+  isValidTransition,
+} from '../../src/host/ctrl/tickets.js'
 import { fakeContext } from '../fake-ctx.js'
 
 const TEAM = {
@@ -302,4 +309,213 @@ test('handoff injects active tickets as reference state without mutating system 
   }))
   const bounded = formatActiveTicketsSummary(many, () => 'Chief')
   assert.match(bounded, /more active ticket/)
+})
+
+test('ticket store migrates v1 and v2 databases cleanly to v3 preserving existing rows', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'ds-bot-ticket-migrate-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5 }))
+
+  const v1Db = join(dir, 'v1.sqlite')
+  const legacyV1 = new DatabaseSync(v1Db)
+  legacyV1.exec(`
+    CREATE TABLE tickets (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      goal TEXT NOT NULL,
+      mandate TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL,
+      owner_bot_id TEXT NOT NULL,
+      created_by_bot_id TEXT NOT NULL,
+      next_step TEXT NOT NULL DEFAULT '',
+      blockers TEXT NOT NULL DEFAULT '',
+      artifacts TEXT NOT NULL DEFAULT '[]',
+      revision INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    INSERT INTO tickets (id, title, goal, status, owner_bot_id, created_by_bot_id, created_at, updated_at)
+    VALUES ('tkt-legacy01', 'Legacy V1', 'Keep row intact', 'open', 'm1', 'm1', 1000, 1000);
+    PRAGMA user_version = 1;
+  `)
+  legacyV1.close()
+
+  const migratedV1 = createTicketStore(v1Db)
+  const v1Check = new DatabaseSync(v1Db)
+  assert.equal(v1Check.prepare('PRAGMA user_version').get().user_version, 3)
+  v1Check.close()
+  const keptV1 = migratedV1.get('tkt-legacy01')
+  assert.equal(keptV1.title, 'Legacy V1')
+  assert.equal(keptV1.acceptance, '')
+  const v1Asg = migratedV1.createAssignment({ ticketId: keptV1.id, prompt: 'Run migrated ticket' })
+  assert.equal(v1Asg.status, 'pending')
+  migratedV1.close()
+
+  const v2Db = join(dir, 'v2.sqlite')
+  const legacyV2 = new DatabaseSync(v2Db)
+  legacyV2.exec(`
+    CREATE TABLE tickets (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      goal TEXT NOT NULL,
+      mandate TEXT NOT NULL DEFAULT '',
+      acceptance TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL,
+      owner_bot_id TEXT NOT NULL,
+      created_by_bot_id TEXT NOT NULL,
+      next_step TEXT NOT NULL DEFAULT '',
+      blockers TEXT NOT NULL DEFAULT '',
+      waiting_on TEXT NOT NULL DEFAULT '',
+      wake_condition TEXT NOT NULL DEFAULT '',
+      deadline INTEGER,
+      artifacts TEXT NOT NULL DEFAULT '[]',
+      revision INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    INSERT INTO tickets (id, title, goal, mandate, status, owner_bot_id, created_by_bot_id, created_at, updated_at)
+    VALUES ('tkt-legacy02', 'Legacy V2', 'Preserve v2 row', 'Read-only', 'in_progress', 'm1', 'm1', 2000, 2000);
+    PRAGMA user_version = 2;
+  `)
+  legacyV2.close()
+
+  const migratedV2 = createTicketStore(v2Db)
+  const v2Check = new DatabaseSync(v2Db)
+  assert.equal(v2Check.prepare('PRAGMA user_version').get().user_version, 3)
+  v2Check.close()
+  const keptV2 = migratedV2.get('tkt-legacy02')
+  assert.equal(keptV2.mandate, 'Read-only')
+  const dispatched = migratedV2.dispatchWithEffect({ ticketId: keptV2.id, idempotencyKey: 'mig-v2-key' })
+  assert.equal(dispatched.deduplicated, false)
+  assert.equal(dispatched.assignment.mandateSnapshot, 'Read-only')
+  migratedV2.close()
+})
+
+test('assignments, effects backoff/dead-letter, and recoverInterrupted survive simulated host restarts', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'ds-bot-ticket-v3-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5 }))
+  const dbPath = join(dir, 'tickets.sqlite')
+
+  assert.deepEqual(ASSIGNMENT_STATUSES, ['pending', 'running', 'ended', 'interrupted'])
+  assert.deepEqual(EFFECT_STATUSES, ['pending', 'running', 'done', 'dead'])
+
+  const store1 = createTicketStore(dbPath)
+  const ticket = store1.create({
+    title: 'Background Build',
+    goal: 'Build and verify module',
+    mandate: 'Only touch ds-bot/',
+    ownerBotId: 'm1',
+    createdByBotId: 'm1',
+  })
+
+  // Atomic dispatchWithEffect deduplicates by idempotencyKey.
+  const first = store1.dispatchWithEffect({
+    ticketId: ticket.id,
+    priority: 'human',
+    triggerKind: 'manual',
+    triggerRef: 'msg-1',
+    prompt: 'Execute task now',
+    idempotencyKey: 'dispatch:req-1',
+    maxAttempts: 3,
+    now: 1000,
+  })
+  assert.equal(first.deduplicated, false)
+  assert.equal(first.assignment.status, 'pending')
+  assert.equal(first.assignment.priority, 'human')
+  assert.equal(first.assignment.ticketRevision, 1)
+  assert.equal(first.assignment.mandateSnapshot, 'Only touch ds-bot/')
+  assert.equal(first.effect.status, 'pending')
+
+  const duplicate = store1.dispatchWithEffect({
+    ticketId: ticket.id,
+    idempotencyKey: 'dispatch:req-1',
+    now: 1100,
+  })
+  assert.equal(duplicate.deduplicated, true)
+  assert.equal(duplicate.assignment.id, first.assignment.id)
+  assert.equal(duplicate.effect.id, first.effect.id)
+  assert.equal(store1.listAssignments({ ticketId: ticket.id }).length, 1)
+
+  // Start assignment & claim effect cleanly.
+  const claimed = store1.claimDueEffects({ now: 1200 })
+  assert.equal(claimed.length, 1)
+  assert.equal(claimed[0].status, 'running')
+  const runningAsg = store1.startAssignment(first.assignment.id, { workerSessionId: `worker-${ticket.id}-1`, now: 1200 })
+  assert.equal(runningAsg.status, 'running')
+  assert.equal(runningAsg.workerSessionId, `worker-${ticket.id}-1`)
+  store1.updateAssignmentUsage(runningAsg.id, { stepCount: 4, tokenUsage: 1500, now: 1250 })
+
+  // Separate effect tests exponential backoff up to dead-letter after 3 failures.
+  const { effect: retryEff } = store1.enqueueEffect({
+    kind: 'notify_chief',
+    ticketId: ticket.id,
+    idempotencyKey: 'notify:1',
+    payload: { msg: 'ping' },
+    maxAttempts: 3,
+    runAt: 1000,
+    now: 1000,
+  })
+  assert.equal(store1.claimDueEffects({ now: 1200, kinds: ['notify_chief'] }).length, 1)
+  const fail1 = store1.failEffect(retryEff.id, 'network timeout', { now: 2000, baseDelayMs: 500, maxDelayMs: 5000 })
+  assert.equal(fail1.status, 'pending')
+  assert.equal(fail1.attempts, 1)
+  assert.equal(fail1.nextRunAt, 2500)
+
+  // Not due before 2500.
+  assert.equal(store1.claimDueEffects({ now: 2499, kinds: ['notify_chief'] }).length, 0)
+  assert.equal(store1.claimDueEffects({ now: 2500, kinds: ['notify_chief'] }).length, 1)
+  const fail2 = store1.failEffect(retryEff.id, 'still down', { now: 3000, baseDelayMs: 500, maxDelayMs: 5000 })
+  assert.equal(fail2.status, 'pending')
+  assert.equal(fail2.attempts, 2)
+  assert.equal(fail2.nextRunAt, 4000)
+
+  assert.equal(store1.claimDueEffects({ now: 4000, kinds: ['notify_chief'] }).length, 1)
+  const fail3 = store1.failEffect(retryEff.id, 'permanent failure', { now: 4100, baseDelayMs: 500, maxDelayMs: 5000 })
+  assert.equal(fail3.status, 'dead')
+  assert.equal(fail3.attempts, 3)
+  assert.equal(fail3.completedAt, 4100)
+
+  // Complete a separate assignment normally to verify ended state is untouched by crash recovery.
+  const finishedAsg = store1.createAssignment({ ticketId: ticket.id, prompt: 'Quick check', now: 4200 })
+  store1.startAssignment(finishedAsg.id, { workerSessionId: `worker-${ticket.id}-2`, now: 4210 })
+  const endedAsg = store1.completeAssignment(finishedAsg.id, {
+    reportStatus: 'review',
+    reportSummary: 'Checks passed',
+    reportArtifacts: ['artifact://art-1'],
+    stepCount: 2,
+    tokenUsage: 400,
+    now: 4300,
+  })
+  assert.equal(endedAsg.status, 'ended')
+  assert.equal(endedAsg.reportStatus, 'review')
+
+  store1.close()
+
+  // Simulate host restart: reopen SQLite and recover interrupted running assignment & effect.
+  const store2 = createTicketStore(dbPath)
+  try {
+    const recovered = store2.recoverInterrupted({ now: 9000, note: 'Recovered after power loss' })
+    assert.equal(recovered.interruptedAssignments.length, 1)
+    assert.equal(recovered.interruptedAssignments[0].id, first.assignment.id)
+    assert.equal(recovered.interruptedAssignments[0].status, 'interrupted')
+    assert.equal(recovered.interruptedAssignments[0].recoveryNote, 'Recovered after power loss')
+    assert.equal(recovered.requeuedEffects.length, 1)
+    assert.equal(recovered.requeuedEffects[0].id, first.effect.id)
+    assert.equal(recovered.requeuedEffects[0].status, 'pending')
+    assert.equal(recovered.recoveryEffects.length, 1)
+    assert.equal(recovered.recoveryEffects[0].kind, 'recover_assignment')
+    assert.equal(recovered.recoveryEffects[0].payload.previousRevision, 1)
+    assert.equal(recovered.recoveryEffects[0].payload.recoveryNote, 'Recovered after power loss')
+
+    // Re-running recoverInterrupted when nothing is running is a no-op.
+    const secondRecover = store2.recoverInterrupted({ now: 9500 })
+    assert.equal(secondRecover.interruptedAssignments.length, 0)
+    assert.equal(secondRecover.requeuedEffects.length, 0)
+    assert.equal(secondRecover.recoveryEffects.length, 0)
+
+    // Ended assignment stayed ended.
+    assert.equal(store2.getAssignment(finishedAsg.id).status, 'ended')
+    assert.equal(store2.getAssignment(first.assignment.id).stepCount, 4)
+  } finally {
+    store2.close()
+  }
 })

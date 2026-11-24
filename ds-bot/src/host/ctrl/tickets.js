@@ -8,11 +8,15 @@ import { DatabaseSync } from 'node:sqlite'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { output } from '../tools.js'
 
-const SCHEMA_VERSION = 2
+const SCHEMA_VERSION = 3
 
 export const TICKET_STATUSES = ['open', 'in_progress', 'waiting_user', 'blocked', 'review', 'done', 'failed', 'cancelled']
 export const ACTIVE_TICKET_STATUSES = ['open', 'in_progress', 'waiting_user', 'blocked', 'review']
 export const TERMINAL_TICKET_STATUSES = new Set(['done', 'failed', 'cancelled'])
+export const ASSIGNMENT_STATUSES = ['pending', 'running', 'ended', 'interrupted']
+export const ACTIVE_ASSIGNMENT_STATUSES = ['pending', 'running']
+export const ASSIGNMENT_PRIORITIES = ['normal', 'human']
+export const EFFECT_STATUSES = ['pending', 'running', 'done', 'dead']
 
 export const TICKET_TRANSITIONS = Object.freeze({
   open: ['in_progress', 'waiting_user', 'blocked', 'review', 'done', 'failed', 'cancelled'],
@@ -35,6 +39,14 @@ const WAITING_ON_MAX = 120
 const WAKE_CONDITION_MAX = 300
 const ARTIFACTS_MAX = 20
 const ARTIFACT_ITEM_MAX = 300
+const SESSION_ID_MAX = 160
+const TRIGGER_KIND_MAX = 80
+const TRIGGER_REF_MAX = 240
+const ASSIGNMENT_PROMPT_MAX = 4000
+const REPORT_SUMMARY_MAX = 2000
+const RECOVERY_NOTE_MAX = 500
+const ERROR_MSG_MAX = 500
+const EFFECT_KEY_MAX = 200
 const SUMMARY_MAX_TICKETS = 12
 const SUMMARY_MAX_CHARS = 3200
 
@@ -97,6 +109,62 @@ function parseArtifacts(raw) {
   }
 }
 
+function parseJsonObject(raw) {
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+function rowToAssignment(row) {
+  if (row === undefined) return undefined
+  return {
+    id: row.id,
+    ticketId: row.ticket_id,
+    workerSessionId: row.worker_session_id ?? '',
+    status: row.status,
+    priority: row.priority ?? 'normal',
+    triggerKind: row.trigger_kind ?? 'manual',
+    triggerRef: row.trigger_ref ?? '',
+    prompt: row.prompt ?? '',
+    mandateSnapshot: row.mandate_snapshot ?? '',
+    ticketRevision: row.ticket_revision,
+    reportStatus: row.report_status ?? '',
+    reportSummary: row.report_summary ?? '',
+    reportArtifacts: parseArtifacts(row.report_artifacts),
+    recoveryNote: row.recovery_note ?? '',
+    error: row.error ?? '',
+    stepCount: row.step_count ?? 0,
+    tokenUsage: row.token_usage ?? 0,
+    createdAt: row.created_at,
+    startedAt: row.started_at ?? null,
+    endedAt: row.ended_at ?? null,
+    updatedAt: row.updated_at,
+  }
+}
+
+function rowToEffect(row) {
+  if (row === undefined) return undefined
+  return {
+    id: row.id,
+    kind: row.kind,
+    ticketId: row.ticket_id ?? '',
+    assignmentId: row.assignment_id ?? '',
+    idempotencyKey: row.idempotency_key ?? null,
+    payload: parseJsonObject(row.payload),
+    status: row.status,
+    attempts: row.attempts ?? 0,
+    maxAttempts: row.max_attempts ?? 5,
+    nextRunAt: row.next_run_at,
+    lastError: row.last_error ?? '',
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    completedAt: row.completed_at ?? null,
+  }
+}
+
 function rowToTicket(row) {
   if (row === undefined) return undefined
   return {
@@ -126,41 +194,96 @@ export function createTicketStore(dbPath) {
   try {
     db.exec('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;')
     const version = db.prepare('PRAGMA user_version').get().user_version
-    if (version === 0) {
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS tickets (
-          id TEXT PRIMARY KEY,
-          title TEXT NOT NULL,
-          goal TEXT NOT NULL,
-          mandate TEXT NOT NULL DEFAULT '',
-          acceptance TEXT NOT NULL DEFAULT '',
-          status TEXT NOT NULL,
-          owner_bot_id TEXT NOT NULL,
-          created_by_bot_id TEXT NOT NULL,
-          next_step TEXT NOT NULL DEFAULT '',
-          blockers TEXT NOT NULL DEFAULT '',
-          waiting_on TEXT NOT NULL DEFAULT '',
-          wake_condition TEXT NOT NULL DEFAULT '',
-          deadline INTEGER,
-          artifacts TEXT NOT NULL DEFAULT '[]',
-          revision INTEGER NOT NULL DEFAULT 1,
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_tickets_status_updated ON tickets(status, updated_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_tickets_owner_status ON tickets(owner_bot_id, status, updated_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_tickets_deadline ON tickets(deadline);
-        PRAGMA user_version = ${SCHEMA_VERSION};
-      `)
-    } else if (version === 1) {
-      db.exec(`
-        ALTER TABLE tickets ADD COLUMN acceptance TEXT NOT NULL DEFAULT '';
-        ALTER TABLE tickets ADD COLUMN waiting_on TEXT NOT NULL DEFAULT '';
-        ALTER TABLE tickets ADD COLUMN wake_condition TEXT NOT NULL DEFAULT '';
-        ALTER TABLE tickets ADD COLUMN deadline INTEGER;
-        CREATE INDEX IF NOT EXISTS idx_tickets_deadline ON tickets(deadline);
-        PRAGMA user_version = ${SCHEMA_VERSION};
-      `)
+    if (version < SCHEMA_VERSION) {
+      db.exec('BEGIN IMMEDIATE')
+      try {
+        if (version === 0) {
+          db.exec(`
+            CREATE TABLE IF NOT EXISTS tickets (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              goal TEXT NOT NULL,
+              mandate TEXT NOT NULL DEFAULT '',
+              acceptance TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL,
+              owner_bot_id TEXT NOT NULL,
+              created_by_bot_id TEXT NOT NULL,
+              next_step TEXT NOT NULL DEFAULT '',
+              blockers TEXT NOT NULL DEFAULT '',
+              waiting_on TEXT NOT NULL DEFAULT '',
+              wake_condition TEXT NOT NULL DEFAULT '',
+              deadline INTEGER,
+              artifacts TEXT NOT NULL DEFAULT '[]',
+              revision INTEGER NOT NULL DEFAULT 1,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tickets_status_updated ON tickets(status, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_tickets_owner_status ON tickets(owner_bot_id, status, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_tickets_deadline ON tickets(deadline);
+          `)
+        } else if (version === 1) {
+          db.exec(`
+            ALTER TABLE tickets ADD COLUMN acceptance TEXT NOT NULL DEFAULT '';
+            ALTER TABLE tickets ADD COLUMN waiting_on TEXT NOT NULL DEFAULT '';
+            ALTER TABLE tickets ADD COLUMN wake_condition TEXT NOT NULL DEFAULT '';
+            ALTER TABLE tickets ADD COLUMN deadline INTEGER;
+            CREATE INDEX IF NOT EXISTS idx_tickets_deadline ON tickets(deadline);
+          `)
+        }
+        db.exec(`
+          CREATE TABLE IF NOT EXISTS assignments (
+            id TEXT PRIMARY KEY,
+            ticket_id TEXT NOT NULL,
+            worker_session_id TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL,
+            priority TEXT NOT NULL DEFAULT 'normal',
+            trigger_kind TEXT NOT NULL DEFAULT 'manual',
+            trigger_ref TEXT NOT NULL DEFAULT '',
+            prompt TEXT NOT NULL DEFAULT '',
+            mandate_snapshot TEXT NOT NULL DEFAULT '',
+            ticket_revision INTEGER NOT NULL,
+            report_status TEXT NOT NULL DEFAULT '',
+            report_summary TEXT NOT NULL DEFAULT '',
+            report_artifacts TEXT NOT NULL DEFAULT '[]',
+            recovery_note TEXT NOT NULL DEFAULT '',
+            error TEXT NOT NULL DEFAULT '',
+            step_count INTEGER NOT NULL DEFAULT 0,
+            token_usage INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            ended_at INTEGER,
+            updated_at INTEGER NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_assignments_ticket_created ON assignments(ticket_id, created_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_assignments_status_created ON assignments(status, created_at ASC);
+
+          CREATE TABLE IF NOT EXISTS effects (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            ticket_id TEXT NOT NULL DEFAULT '',
+            assignment_id TEXT NOT NULL DEFAULT '',
+            idempotency_key TEXT UNIQUE,
+            payload TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 5,
+            next_run_at INTEGER NOT NULL,
+            last_error TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            completed_at INTEGER
+          );
+          CREATE INDEX IF NOT EXISTS idx_effects_status_next_run ON effects(status, next_run_at ASC);
+          CREATE INDEX IF NOT EXISTS idx_effects_ticket ON effects(ticket_id, created_at DESC);
+
+          PRAGMA user_version = ${SCHEMA_VERSION};
+        `)
+        db.exec('COMMIT')
+      } catch (migError) {
+        try { db.exec('ROLLBACK') } catch {}
+        throw migError
+      }
     }
     db.exec(`
       CREATE TABLE IF NOT EXISTS ctrl_meta (
@@ -350,12 +473,482 @@ export function createTicketStore(dbPath) {
     return get(existing.id)
   }
 
+  let txDepth = 0
+  function inTransaction(fn) {
+    if (txDepth > 0) return fn()
+    db.exec('BEGIN IMMEDIATE')
+    txDepth += 1
+    try {
+      const result = fn()
+      db.exec('COMMIT')
+      return result
+    } catch (error) {
+      try { db.exec('ROLLBACK') } catch {}
+      throw error
+    } finally {
+      txDepth -= 1
+    }
+  }
+
+  const stmtInsertAssignment = db.prepare(`
+    INSERT INTO assignments (
+      id, ticket_id, worker_session_id, status, priority, trigger_kind, trigger_ref,
+      prompt, mandate_snapshot, ticket_revision, created_at, updated_at
+    ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
+  `)
+  const stmtGetAssignment = db.prepare('SELECT * FROM assignments WHERE id = ?')
+  const stmtStartAssignment = db.prepare(`
+    UPDATE assignments
+    SET status = 'running',
+        worker_session_id = CASE WHEN ? <> '' THEN ? ELSE worker_session_id END,
+        started_at = COALESCE(started_at, ?),
+        updated_at = ?
+    WHERE id = ? AND status = 'pending'
+  `)
+  const stmtCompleteAssignment = db.prepare(`
+    UPDATE assignments
+    SET status = 'ended',
+        report_status = ?,
+        report_summary = ?,
+        report_artifacts = ?,
+        error = ?,
+        step_count = COALESCE(?, step_count),
+        token_usage = COALESCE(?, token_usage),
+        ended_at = ?,
+        updated_at = ?
+    WHERE id = ? AND status IN ('pending', 'running')
+  `)
+  const stmtInterruptAssignment = db.prepare(`
+    UPDATE assignments
+    SET status = 'interrupted',
+        recovery_note = ?,
+        error = ?,
+        ended_at = ?,
+        updated_at = ?
+    WHERE id = ? AND status = 'running'
+  `)
+  const stmtUpdateAssignmentUsage = db.prepare(`
+    UPDATE assignments
+    SET step_count = COALESCE(?, step_count),
+        token_usage = COALESCE(?, token_usage),
+        updated_at = ?
+    WHERE id = ?
+  `)
+
+  const stmtInsertEffect = db.prepare(`
+    INSERT INTO effects (
+      id, kind, ticket_id, assignment_id, idempotency_key, payload,
+      status, attempts, max_attempts, next_run_at, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)
+  `)
+  const stmtGetEffect = db.prepare('SELECT * FROM effects WHERE id = ?')
+  const stmtGetEffectByKey = db.prepare('SELECT * FROM effects WHERE idempotency_key = ?')
+  const stmtClaimEffect = db.prepare(`
+    UPDATE effects
+    SET status = 'running', updated_at = ?
+    WHERE id = ? AND status = 'pending'
+  `)
+  const stmtCompleteEffect = db.prepare(`
+    UPDATE effects
+    SET status = 'done', completed_at = ?, updated_at = ?
+    WHERE id = ? AND status IN ('pending', 'running')
+  `)
+  const stmtFailEffect = db.prepare(`
+    UPDATE effects
+    SET status = ?, attempts = ?, next_run_at = ?, last_error = ?, completed_at = ?, updated_at = ?
+    WHERE id = ?
+  `)
+  const stmtRequeueRunningEffects = db.prepare(`
+    UPDATE effects
+    SET status = 'pending', next_run_at = ?, updated_at = ?
+    WHERE status = 'running'
+  `)
+
+  function createAssignment({
+    ticketId,
+    priority = 'normal',
+    triggerKind = 'manual',
+    triggerRef = '',
+    prompt = '',
+    workerSessionId = '',
+    now = Date.now(),
+  }) {
+    const cleanTicketId = cleanText(ticketId, 'ticket_id', 120, { required: true })
+    const ticket = get(cleanTicketId)
+    if (ticket === undefined) throw new Error(`Ticket not found: ${cleanTicketId}`)
+    if (TERMINAL_TICKET_STATUSES.has(ticket.status)) {
+      throw new Error(`Cannot create assignment for ${ticket.status} ticket ${ticket.id}.`)
+    }
+    if (!ASSIGNMENT_PRIORITIES.includes(priority)) {
+      throw new Error(`Invalid assignment priority "${priority}". Valid: ${ASSIGNMENT_PRIORITIES.join(', ')}.`)
+    }
+    const cleanSession = cleanText(workerSessionId, 'worker_session_id', SESSION_ID_MAX)
+    const cleanTriggerKind = cleanText(triggerKind, 'trigger_kind', TRIGGER_KIND_MAX) || 'manual'
+    const cleanTriggerRef = cleanText(triggerRef, 'trigger_ref', TRIGGER_REF_MAX)
+    const cleanPrompt = cleanText(prompt, 'prompt', ASSIGNMENT_PROMPT_MAX)
+    const id = `asg-${randomUUID().slice(0, 8)}`
+    stmtInsertAssignment.run(
+      id,
+      ticket.id,
+      cleanSession,
+      priority,
+      cleanTriggerKind,
+      cleanTriggerRef,
+      cleanPrompt,
+      ticket.mandate,
+      ticket.revision,
+      now,
+      now,
+    )
+    return rowToAssignment(stmtGetAssignment.get(id))
+  }
+
+  function getAssignment(id) {
+    if (typeof id !== 'string' || id.trim() === '') return undefined
+    return rowToAssignment(stmtGetAssignment.get(id.trim()))
+  }
+
+  function listAssignments({ ticketId, status, activeOnly = false, limit = 50 } = {}) {
+    const where = []
+    const args = []
+    if (ticketId !== undefined) {
+      where.push('ticket_id = ?')
+      args.push(String(ticketId).trim())
+    }
+    if (status !== undefined) {
+      if (!ASSIGNMENT_STATUSES.includes(status)) {
+        throw new Error(`Unknown assignment status "${status}". Valid: ${ASSIGNMENT_STATUSES.join(', ')}.`)
+      }
+      where.push('status = ?')
+      args.push(status)
+    } else if (activeOnly) {
+      where.push(`status IN (${ACTIVE_ASSIGNMENT_STATUSES.map(() => '?').join(', ')})`)
+      args.push(...ACTIVE_ASSIGNMENT_STATUSES)
+    }
+    const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 200) : 50
+    const sql = `SELECT * FROM assignments${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY created_at DESC LIMIT ?`
+    return db.prepare(sql).all(...args, safeLimit).map(rowToAssignment)
+  }
+
+  function startAssignment(id, { workerSessionId = '', now = Date.now() } = {}) {
+    const cleanId = cleanText(id, 'assignment_id', 120, { required: true })
+    const cleanSession = cleanText(workerSessionId, 'worker_session_id', SESSION_ID_MAX)
+    const res = stmtStartAssignment.run(cleanSession, cleanSession, now, now, cleanId)
+    if (res.changes === 0) {
+      const existing = getAssignment(cleanId)
+      if (existing === undefined) throw new Error(`Assignment not found: ${cleanId}`)
+      throw new Error(`Assignment ${existing.id} cannot start from status "${existing.status}".`)
+    }
+    return getAssignment(cleanId)
+  }
+
+  function completeAssignment(id, {
+    reportStatus = 'done',
+    reportSummary = '',
+    reportArtifacts = [],
+    stepCount,
+    tokenUsage,
+    error = '',
+    now = Date.now(),
+  } = {}) {
+    const cleanId = cleanText(id, 'assignment_id', 120, { required: true })
+    const cleanReportStatus = cleanText(reportStatus, 'report_status', 60) || 'done'
+    const cleanSummary = cleanText(reportSummary, 'report_summary', REPORT_SUMMARY_MAX)
+    const cleanArts = cleanArtifacts(reportArtifacts)
+    const cleanError = cleanText(error, 'error', ERROR_MSG_MAX)
+    const nextSteps = Number.isInteger(stepCount) && stepCount >= 0 ? stepCount : null
+    const nextTokens = Number.isInteger(tokenUsage) && tokenUsage >= 0 ? tokenUsage : null
+    const res = stmtCompleteAssignment.run(
+      cleanReportStatus,
+      cleanSummary,
+      JSON.stringify(cleanArts),
+      cleanError,
+      nextSteps,
+      nextTokens,
+      now,
+      now,
+      cleanId,
+    )
+    if (res.changes === 0) {
+      const existing = getAssignment(cleanId)
+      if (existing === undefined) throw new Error(`Assignment not found: ${cleanId}`)
+      throw new Error(`Assignment ${existing.id} cannot end from status "${existing.status}".`)
+    }
+    return getAssignment(cleanId)
+  }
+
+  function interruptAssignment(id, {
+    recoveryNote = '',
+    error = '',
+    now = Date.now(),
+  } = {}) {
+    const cleanId = cleanText(id, 'assignment_id', 120, { required: true })
+    const cleanNote = cleanText(recoveryNote, 'recovery_note', RECOVERY_NOTE_MAX)
+    const cleanError = cleanText(error, 'error', ERROR_MSG_MAX)
+    const res = stmtInterruptAssignment.run(cleanNote, cleanError, now, now, cleanId)
+    if (res.changes === 0) {
+      const existing = getAssignment(cleanId)
+      if (existing === undefined) throw new Error(`Assignment not found: ${cleanId}`)
+      throw new Error(`Assignment ${existing.id} cannot be interrupted from status "${existing.status}".`)
+    }
+    return getAssignment(cleanId)
+  }
+
+  function updateAssignmentUsage(id, { stepCount, tokenUsage, now = Date.now() } = {}) {
+    const cleanId = cleanText(id, 'assignment_id', 120, { required: true })
+    const existing = getAssignment(cleanId)
+    if (existing === undefined) throw new Error(`Assignment not found: ${cleanId}`)
+    const nextSteps = Number.isInteger(stepCount) && stepCount >= 0 ? stepCount : null
+    const nextTokens = Number.isInteger(tokenUsage) && tokenUsage >= 0 ? tokenUsage : null
+    stmtUpdateAssignmentUsage.run(nextSteps, nextTokens, now, cleanId)
+    return getAssignment(cleanId)
+  }
+
+  function getEffect(id) {
+    if (typeof id !== 'string' || id.trim() === '') return undefined
+    return rowToEffect(stmtGetEffect.get(id.trim()))
+  }
+
+  function getEffectByKey(idempotencyKey) {
+    if (typeof idempotencyKey !== 'string' || idempotencyKey.trim() === '') return undefined
+    return rowToEffect(stmtGetEffectByKey.get(idempotencyKey.trim()))
+  }
+
+  function enqueueEffect({
+    kind,
+    ticketId = '',
+    assignmentId = '',
+    idempotencyKey = null,
+    payload = {},
+    maxAttempts = 5,
+    runAt = Date.now(),
+    now = Date.now(),
+  } = {}) {
+    const cleanKind = cleanText(kind, 'effect kind', 80, { required: true })
+    const cleanTicketId = cleanText(ticketId, 'ticket_id', 120)
+    const cleanAssignmentId = cleanText(assignmentId, 'assignment_id', 120)
+    const cleanKey = idempotencyKey === null || idempotencyKey === undefined || String(idempotencyKey).trim() === ''
+      ? null
+      : cleanText(idempotencyKey, 'idempotency_key', EFFECT_KEY_MAX, { required: true })
+    const safeMaxAttempts = Number.isInteger(maxAttempts) && maxAttempts >= 1 && maxAttempts <= 100 ? maxAttempts : 5
+    const safeRunAt = Number.isFinite(runAt) ? Math.trunc(runAt) : now
+    const payloadJson = JSON.stringify(payload !== null && typeof payload === 'object' && !Array.isArray(payload) ? payload : {})
+
+    return inTransaction(() => {
+      if (cleanKey !== null) {
+        const existing = getEffectByKey(cleanKey)
+        if (existing !== undefined) return { effect: existing, deduplicated: true }
+      }
+      const id = `eff-${randomUUID().slice(0, 8)}`
+      stmtInsertEffect.run(
+        id,
+        cleanKind,
+        cleanTicketId,
+        cleanAssignmentId,
+        cleanKey,
+        payloadJson,
+        safeMaxAttempts,
+        safeRunAt,
+        now,
+        now,
+      )
+      return { effect: rowToEffect(stmtGetEffect.get(id)), deduplicated: false }
+    })
+  }
+
+  function listEffects({ status, ticketId, assignmentId, limit = 50 } = {}) {
+    const where = []
+    const args = []
+    if (status !== undefined) {
+      if (!EFFECT_STATUSES.includes(status)) {
+        throw new Error(`Unknown effect status "${status}". Valid: ${EFFECT_STATUSES.join(', ')}.`)
+      }
+      where.push('status = ?')
+      args.push(status)
+    }
+    if (ticketId !== undefined) {
+      where.push('ticket_id = ?')
+      args.push(String(ticketId).trim())
+    }
+    if (assignmentId !== undefined) {
+      where.push('assignment_id = ?')
+      args.push(String(assignmentId).trim())
+    }
+    const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 200) : 50
+    const sql = `SELECT * FROM effects${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY next_run_at ASC, created_at ASC LIMIT ?`
+    return db.prepare(sql).all(...args, safeLimit).map(rowToEffect)
+  }
+
+  function claimDueEffects({ now = Date.now(), limit = 20, kinds } = {}) {
+    if (Array.isArray(kinds) && kinds.length === 0) return []
+    const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 200) : 20
+    const where = ["status = 'pending'", 'next_run_at <= ?']
+    const args = [now]
+    if (Array.isArray(kinds)) {
+      where.push(`kind IN (${kinds.map(() => '?').join(', ')})`)
+      args.push(...kinds.map(k => String(k)))
+    }
+    return inTransaction(() => {
+      const rows = db.prepare(
+        `SELECT id FROM effects WHERE ${where.join(' AND ')} ORDER BY next_run_at ASC, created_at ASC LIMIT ?`,
+      ).all(...args, safeLimit)
+      const claimed = []
+      for (const row of rows) {
+        const res = stmtClaimEffect.run(now, row.id)
+        if (res.changes > 0) claimed.push(getEffect(row.id))
+      }
+      return claimed
+    })
+  }
+
+  function completeEffect(id, { now = Date.now() } = {}) {
+    const cleanId = cleanText(id, 'effect_id', 120, { required: true })
+    const res = stmtCompleteEffect.run(now, now, cleanId)
+    if (res.changes === 0) {
+      const existing = getEffect(cleanId)
+      if (existing === undefined) throw new Error(`Effect not found: ${cleanId}`)
+      throw new Error(`Effect ${existing.id} cannot complete from status "${existing.status}".`)
+    }
+    return getEffect(cleanId)
+  }
+
+  function failEffect(id, error, { now = Date.now(), baseDelayMs = 1000, maxDelayMs = 60_000 } = {}) {
+    const cleanId = cleanText(id, 'effect_id', 120, { required: true })
+    const msg = oneLine(error?.message ?? String(error ?? 'Unknown error'), ERROR_MSG_MAX)
+    return inTransaction(() => {
+      const existing = getEffect(cleanId)
+      if (existing === undefined) throw new Error(`Effect not found: ${cleanId}`)
+      if (existing.status === 'done' || existing.status === 'dead') {
+        throw new Error(`Effect ${existing.id} is already ${existing.status}.`)
+      }
+      const nextAttempts = existing.attempts + 1
+      const isDead = nextAttempts >= existing.maxAttempts
+      const nextStatus = isDead ? 'dead' : 'pending'
+      const delay = Math.min(maxDelayMs, Math.max(0, baseDelayMs) * (2 ** Math.max(0, nextAttempts - 1)))
+      const nextRunAt = isDead ? existing.nextRunAt : now + delay
+      const completedAt = isDead ? now : null
+      stmtFailEffect.run(nextStatus, nextAttempts, nextRunAt, msg, completedAt, now, cleanId)
+      return getEffect(cleanId)
+    })
+  }
+
+  function dispatchWithEffect({
+    ticketId,
+    priority = 'normal',
+    triggerKind = 'manual',
+    triggerRef = '',
+    prompt = '',
+    effectKind = 'dispatch_assignment',
+    idempotencyKey = null,
+    maxAttempts = 5,
+    now = Date.now(),
+  } = {}) {
+    const cleanKey = idempotencyKey === null || idempotencyKey === undefined || String(idempotencyKey).trim() === ''
+      ? null
+      : cleanText(idempotencyKey, 'idempotency_key', EFFECT_KEY_MAX, { required: true })
+
+    return inTransaction(() => {
+      if (cleanKey !== null) {
+        const existingEffect = getEffectByKey(cleanKey)
+        if (existingEffect !== undefined) {
+          return {
+            deduplicated: true,
+            assignment: existingEffect.assignmentId ? getAssignment(existingEffect.assignmentId) : undefined,
+            effect: existingEffect,
+          }
+        }
+      }
+      const assignment = createAssignment({
+        ticketId,
+        priority,
+        triggerKind,
+        triggerRef,
+        prompt,
+        now,
+      })
+      const { effect } = enqueueEffect({
+        kind: effectKind,
+        ticketId: assignment.ticketId,
+        assignmentId: assignment.id,
+        idempotencyKey: cleanKey,
+        payload: {
+          assignmentId: assignment.id,
+          ticketId: assignment.ticketId,
+          priority: assignment.priority,
+          ticketRevision: assignment.ticketRevision,
+          triggerKind: assignment.triggerKind,
+          triggerRef: assignment.triggerRef,
+        },
+        maxAttempts,
+        runAt: now,
+        now,
+      })
+      return { deduplicated: false, assignment, effect }
+    })
+  }
+
+  function recoverInterrupted({
+    now = Date.now(),
+    note = 'Interrupted by host restart before completion.',
+  } = {}) {
+    const cleanNote = cleanText(note, 'recovery_note', RECOVERY_NOTE_MAX) || 'Interrupted by host restart before completion.'
+    return inTransaction(() => {
+      const staleEffects = db.prepare("SELECT id FROM effects WHERE status = 'running' ORDER BY created_at ASC").all()
+      if (staleEffects.length > 0) {
+        stmtRequeueRunningEffects.run(now, now)
+      }
+      const requeuedEffects = staleEffects.map(row => getEffect(row.id)).filter(Boolean)
+
+      const staleAssignments = db.prepare("SELECT * FROM assignments WHERE status = 'running' ORDER BY created_at ASC").all()
+      const interruptedAssignments = []
+      const recoveryEffects = []
+      for (const row of staleAssignments) {
+        const interrupted = interruptAssignment(row.id, { recoveryNote: cleanNote, now })
+        interruptedAssignments.push(interrupted)
+        const { effect } = enqueueEffect({
+          kind: 'recover_assignment',
+          ticketId: interrupted.ticketId,
+          assignmentId: interrupted.id,
+          idempotencyKey: `recover:${interrupted.id}`,
+          payload: {
+            assignmentId: interrupted.id,
+            ticketId: interrupted.ticketId,
+            workerSessionId: interrupted.workerSessionId,
+            priority: interrupted.priority,
+            previousRevision: interrupted.ticketRevision,
+            recoveryNote: cleanNote,
+          },
+          runAt: now,
+          now,
+        })
+        recoveryEffects.push(effect)
+      }
+      return { interruptedAssignments, requeuedEffects, recoveryEffects }
+    })
+  }
+
   return {
     create,
     get,
     list,
     listDue,
     update,
+    createAssignment,
+    getAssignment,
+    listAssignments,
+    startAssignment,
+    completeAssignment,
+    interruptAssignment,
+    updateAssignmentUsage,
+    enqueueEffect,
+    getEffect,
+    getEffectByKey,
+    listEffects,
+    claimDueEffects,
+    completeEffect,
+    failEffect,
+    dispatchWithEffect,
+    recoverInterrupted,
     getMeta,
     setMeta,
     close: () => { db.close() },
