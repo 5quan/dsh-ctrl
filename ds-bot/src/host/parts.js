@@ -734,6 +734,9 @@ export function install(rt) {
   // together without the model carries the last note the model wrote.
   function noteText(segment) {
     if (segment?.fallback === undefined) return segment?.note
+    if (segment.fallback === 'day-rollover') {
+      return segment.rolloverNote || '(New logical day: daily journal and profile are loaded from dsh-memory; previous part messages stay archived and searchable via read_own_chat.)'
+    }
     if (segment.fallback === 'whole') {
       const head = '(No new note: every message of the part was carried over word for word.'
       return segment.note === undefined ? `${head})` : `${head} Below is the note written at the end of part ${segment.noteFrom}, carried over unchanged.)\n\n${segment.note}`
@@ -749,7 +752,7 @@ export function install(rt) {
       : `${head} It is the note written at the end of part ${segment.noteFrom}, carried over unchanged; anything newer is in the messages below, and read_own_chat finds the rest.)\n\n${segment.note}`
   }
 
-  function handoffPackage({ botId, room, self = false, segment, lines, number, resume, overflow, cutoff, failed, bare, folder, manual, engine }) {
+  function handoffPackage({ botId, room, self = false, segment, lines, number, resume, overflow, cutoff, failed, bare, folder, manual, engine, dayRollover }) {
     const where = room === undefined ? 'your own chat with the user'
       : self ? `the group chat "${room.name}"` : `your conversation in the group chat "${room.name}"`
     const lookup = room === undefined
@@ -761,8 +764,9 @@ export function install(rt) {
         : engine !== undefined ? `the user changed what you run on, to ${engine}`
           : cutoff ? 'the previous part kept being cut off at the output limit'
             : folder !== undefined ? `${self ? 'the group\'s' : 'your'} working folder changed to ${folder}`
-              : manual ? 'a fresh conversation was started'
-                : 'the previous part grew long'
+              : dayRollover !== undefined ? `a new logical day started after daily memory rollover${dayRollover.date ? ` (${dayRollover.date})` : ''}`
+                : manual ? 'a fresh conversation was started'
+                  : 'the previous part grew long'
     const { recent, earlier, unlisted, complete } = lines
     const omitted = [
       ...(unlisted > 0 ? [`(${unlisted} older messages are not listed.)`] : []),
@@ -961,10 +965,10 @@ export function install(rt) {
   // `cutoff`: the part kept being cut off at the output limit, so it moves on without
   // asking the model for a note at the same size.
   // `engine`: because the Bot now runs on something else (see engineMoved).
-  function startSwitch(agent, { resume = false, carry = [], info, joined, overflow = false, failed, bare = false, folder = false, manual = false, cutoff = false, engine = false, hard = overflow || folder || manual || engine || cutoff } = {}) {
+  function startSwitch(agent, { resume = false, carry = [], info, joined, overflow = false, failed, bare = false, folder = false, manual = false, cutoff = false, engine = false, dayRollover, hard = overflow || folder || manual || engine || cutoff || dayRollover !== undefined } = {}) {
     const place = placeOf(agent.id)
     if (place === undefined || switches.has(agent.id) || readOnly()) return
-    const job = { ...place, carry: [...carry], info, joined, resume, overflow, failed, bare, folder, engine, hard, manual, cutoff, since: Date.now() }
+    const job = { ...place, carry: [...carry], info, joined, resume, overflow, failed, bare, folder, engine, dayRollover, hard, manual, cutoff, since: Date.now() }
     switches.set(agent.id, job)
     void runSwitch(agent, job)
       .catch(error => {
@@ -1117,7 +1121,7 @@ export function install(rt) {
     const parts = bot === undefined ? partsOf(undefined, room.id) : partsOf(bot.id, room?.id)
     const number = parts.length
     const budget = Math.min(RECENT_TOKENS, Math.floor((lines?.check ?? 4 * RECENT_TOKENS) / 4))
-    const readLines = () => (job.bare ? { recent: [], earlier: [], unlisted: 0, complete: true } : handoffLines(agent.id, { budget, group: room !== undefined, number }))
+    const readLines = () => (job.bare || job.dayRollover !== undefined ? { recent: [], earlier: [], unlisted: 0, complete: true } : handoffLines(agent.id, { budget, group: room !== undefined, number }))
     let carried = job.folder ? await readLines() : undefined
     // A short part with no tool work goes over word for word, so it needs no note.
     const whole = carried?.whole === true && !session.deriveMessages().some(message => message.role === 'tool')
@@ -1127,7 +1131,7 @@ export function install(rt) {
     // for its handoff; the part moves on with the deterministic package.
     const local = bot !== undefined && rt.isLocalAgentRef?.(bot.model ?? bot.appliedModel) === true
     // The group's own Session only relays; it has no route a note could be written with.
-    if (!local && !job.engine && !job.overflow && job.cutoff !== true && job.failed === undefined && !whole && bot !== undefined) {
+    if (!local && !job.engine && !job.overflow && job.cutoff !== true && job.failed === undefined && job.dayRollover === undefined && !whole && bot !== undefined) {
       try {
         written = await writeNote(agent, AbortSignal.any([signal, AbortSignal.timeout(NOTE_TIMEOUT_MS)]), { folder: job.folder })
       } catch (error) {
@@ -1149,6 +1153,7 @@ export function install(rt) {
     const previous = parts.at(-2)
     const earlierNote = previous?.note ? { note: previous.note, noteFrom: previous.noteFrom ?? previous.number } : {}
     const noted = written !== undefined ? { note: written.note }
+      : job.dayRollover !== undefined ? { fallback: 'day-rollover', rolloverDate: job.dayRollover.date, ...(job.dayRollover.summary ? { rolloverNote: job.dayRollover.summary } : {}) }
       : job.engine ? { fallback: 'engine', ...earlierNote }
       : local ? {}
       : { fallback: whole ? 'whole' : job.failed !== undefined ? 'failure' : job.overflow ? 'overflow' : job.cutoff === true ? 'cutoff' : 'failed', ...earlierNote }
@@ -1219,7 +1224,7 @@ export function install(rt) {
         rt.warn('ds-bot: the fresh part of %s did not start in %s; it works in %s', name, intended, cwd)
       }
       const engine = job.engine ? rt.engineNameOf?.(bot.model ?? bot.appliedModel) : undefined
-      const text = handoffPackage({ botId: bot?.id, room, self: bot === undefined, segment, lines: carried, number: number + 1, resume, overflow: job.overflow, cutoff: job.cutoff === true, failed: job.failed, bare: job.bare, folder, manual: job.manual, engine })
+      const text = handoffPackage({ botId: bot?.id, room, self: bot === undefined, segment, lines: carried, number: number + 1, resume, overflow: job.overflow, cutoff: job.cutoff === true, failed: job.failed, bare: job.bare, folder, manual: job.manual, engine, dayRollover: job.dayRollover })
       freshParts.set(freshId, estimateTokens(text))
       fresh.followup(createUserMessage({ content: [{ type: 'text', text }], source: handoffSource(job, resume) }))
       await ctx.sessions.flush(fresh.session)
@@ -1825,6 +1830,25 @@ export function install(rt) {
     return true
   }
 
+  // Lightweight day-rollover switch for Chief when dsh-memory seals yesterday's journal:
+  // skips LLM handoff note generation and 16k transcript carry-over (dsh-memory frozen
+  // prefix already carries PROFILE + yesterday journal), preserving active tickets and schedules.
+  async function rolloverPart(sessionId, { date, summary } = {}) {
+    await rt.load()
+    if (readOnly()) return false
+    const place = placeOf(sessionId)
+    if (place?.botId === undefined || place.roomId !== undefined || switches.has(sessionId)) return false
+    let agent
+    try {
+      agent = await rt.resolveAgent(sessionId)
+    } catch {
+      return false
+    }
+    if (agent.status !== 'idle') return false
+    startSwitch(agent, { dayRollover: { date: String(date ?? ''), ...(summary ? { summary: String(summary) } : {}) } })
+    return true
+  }
+
   // Opening an earlier part again: it becomes the current one and the part that
   // was current joins the earlier ones where it sat.
   async function switchPart(botId, partId) {
@@ -1867,5 +1891,5 @@ export function install(rt) {
     return true
   }
 
-  Object.assign(rt, { clock, partsOf, historyEntry, partLines, noteText, earlierPage, chatPage, displayItems, applySteps, followFolder, followEngine, heldBack, newPart, switchPart, sessionTokens: session => tokensOf(session), switchJobs: () => switches.values() })
+  Object.assign(rt, { clock, partsOf, historyEntry, partLines, noteText, earlierPage, chatPage, displayItems, applySteps, followFolder, followEngine, heldBack, newPart, rolloverPart, switchPart, sessionTokens: session => tokensOf(session), switchJobs: () => switches.values() })
 }

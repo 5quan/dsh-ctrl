@@ -6,7 +6,7 @@ import { existsSync, mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { output } from './tools.js'
+import { output } from '../tools.js'
 
 const SCHEMA_VERSION = 2
 
@@ -162,6 +162,13 @@ export function createTicketStore(dbPath) {
         PRAGMA user_version = ${SCHEMA_VERSION};
       `)
     }
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS ctrl_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `)
   } catch (error) {
     db.close()
     throw error
@@ -181,6 +188,29 @@ export function createTicketStore(dbPath) {
         revision = revision + 1, updated_at = ?
     WHERE id = ? AND revision = ?
   `)
+  const stmtGetMeta = db.prepare('SELECT value FROM ctrl_meta WHERE key = ?')
+  const stmtSetMeta = db.prepare(`
+    INSERT INTO ctrl_meta (key, value, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+  `)
+
+  function getMeta(key) {
+    if (typeof key !== 'string' || key.trim() === '') return undefined
+    const row = stmtGetMeta.get(key.trim())
+    if (row === undefined) return undefined
+    try {
+      return JSON.parse(row.value)
+    } catch {
+      return undefined
+    }
+  }
+
+  function setMeta(key, value, now = Date.now()) {
+    const cleanKey = cleanText(key, 'meta key', 200, { required: true })
+    stmtSetMeta.run(cleanKey, JSON.stringify(value), now)
+    return value
+  }
 
   function create({
     title,
@@ -326,6 +356,8 @@ export function createTicketStore(dbPath) {
     list,
     listDue,
     update,
+    getMeta,
+    setMeta,
     close: () => { db.close() },
   }
 }
@@ -414,6 +446,7 @@ export function install(rt) {
     store = undefined
   }, 'ds-bot: tickets')
 
+  const hasTicketStore = () => store !== undefined || existsSync(dbPath)
   const isPrivate = botId => rt.botOf(botId)?.private === true
   const botNameOf = botId => rt.botOf(botId)?.name ?? botId
 
@@ -525,6 +558,9 @@ export function install(rt) {
       deadline: { type: 'string', description: 'Updated ISO-8601 date string or epoch ms (pass empty string to clear).' },
       blockers: { type: 'string', description: 'Updated blockers (pass empty string to clear).' },
       artifacts: { type: 'array', items: { type: 'string' }, description: 'Updated list of artifact paths/handles.' },
+      retrospective: { type: 'string', description: 'Optional lesson learned, pitfall, or verified fact when closing a ticket (done or failed); forwarded as a pending candidate to dsh-memory buffer (never writes PROFILE.md directly).' },
+      retrospective_target: { type: 'string', description: 'Optional dsh-memory buffer target ("note", "profile", "entity:<name>", or "lesson:<name>"). Defaults to "lesson:<title>" when status is "failed" and "note" when status is "done".' },
+      retrospective_tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags for lesson:<name> retrospective candidates.' },
     },
     output,
     async execute(args, exec) {
@@ -585,7 +621,34 @@ export function install(rt) {
         }, {
           expectedRevision: args.expected_revision,
         })
-        return `Updated ${formatTicketDetail(updated, botNameOf)}`
+        let suffix = ''
+        if (typeof args.retrospective === 'string' && args.retrospective.trim() !== '') {
+          if (updated.status !== 'done' && updated.status !== 'failed') {
+            suffix = '\nRetrospective skipped: only recorded when status transitions to "done" or "failed".'
+          } else if (isPrivate(updated.ownerBotId)) {
+            suffix = '\nRetrospective skipped: private Bot tickets do not write to shared dsh-memory.'
+          } else {
+            try {
+              const res = await rt.memoryBridge?.submitTicketRetrospective({
+                ticket: updated,
+                content: args.retrospective,
+                target: args.retrospective_target,
+                tags: args.retrospective_tags,
+                sessionId: exec.agent?.id,
+              })
+              if (res?.ok === true) {
+                suffix = `\nMemory buffer candidate queued (${res.id}, target: ${res.target}, status: ${res.status}).`
+              } else if (res) {
+                suffix = `\nMemory buffer skipped (${res.reason ?? 'unavailable'}).`
+              } else {
+                suffix = '\nMemory buffer skipped (memoryBridge unavailable).'
+              }
+            } catch (bridgeError) {
+              suffix = `\nMemory buffer skipped (${bridgeError.message}).`
+            }
+          }
+        }
+        return `Updated ${formatTicketDetail(updated, botNameOf)}${suffix}`
       } catch (error) {
         return `Could not update ticket: ${error.message}`
       }
@@ -651,5 +714,5 @@ export function install(rt) {
     },
   }))
 
-  Object.assign(rt, { openTicketStore: openStore, activeTicketsSummary })
+  Object.assign(rt, { openTicketStore: openStore, hasTicketStore, canViewTicket: canView, activeTicketsSummary })
 }
