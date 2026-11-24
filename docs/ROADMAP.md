@@ -24,10 +24,10 @@
 
 | 编号 | 需求项 | 落点文件 | 核心内容 | 验收标准 |
 |---|---|---|---|---|
-| **R-2.1** | `Assignment` 与持久化队列 `Effects` | `ctrl/tickets.js`（Schema v2 → v3） | 参考 `dsh-superagent` Stored Work：拆分长期 `Ticket` 与单次派工 `Assignment`（`pending/running/ended/interrupted`），新增持久化 `effects` 队列（先落库、commit 后执行，带幂等键与退避重试）与重启恢复逻辑 | 模拟执行中宿主重启，中断的 Assignment 自动识别并带 recovery note 恢复或回报，不丢不重 |
-| **R-2.2** | 单 Ticket 串行队列与并发槽 | `ctrl/ticket-queue.js` | 单 Ticket 严格 Actor 串行互斥 + `revision` 乐观锁防并发写乱；全局限制 `maxWorkers` 并发槽，并预留 **+1 人类优先槽**保证用户指令不被后台任务堵死 | 同 Ticket 并发入队严格串行；槽位打满时人类唤醒仍可优先拿到执行槽 |
+| **R-2.1** | `Assignment` 与持久化队列 `Effects`（✅ 已完成 `#7`） | `ctrl/tickets.js`（Schema v2 → v3） | 参考 `dsh-superagent` Stored Work：拆分长期 `Ticket` 与单次派工 `Assignment`（`pending/running/ended/interrupted`），新增持久化 `effects` 队列（先落库、commit 后执行，带幂等键与退避重试）与重启恢复逻辑 | 模拟执行中宿主重启，中断的 Assignment 自动识别并带 recovery note 恢复或回报，不丢不重 |
+| **R-2.2** | 单 Ticket 串行队列与并发槽（✅ 已完成 `#7`） | `ctrl/ticket-queue.js` | 单 Ticket 严格 Actor 串行互斥 + `revision` 乐观锁防并发写乱；全局限制 `maxWorkers` 并发槽，并预留 **+1 人类优先槽**保证用户指令不被后台任务堵死 | 同 Ticket 并发入队严格串行；槽位打满时人类唤醒仍可优先拿到执行槽 |
 | **R-2.3** | 一次性隔离 Worker 与结构化回报 | `ctrl/worker-executor.js` | 新增派发工具（如 `ticket_dispatch`）；通过 `ctx.sessionController.create` 建隔离 Session（`worker-<ticketId>`，**不写入 `state.bots`**，带子会话标记避开 `dsh-memory` 原文污染）；仅装配 `Ticket + Mandate + Acceptance + 命中实体/避坑卡 + artifact 句柄`；提供结构化 `ticket_report` 工具申报 `progress/waiting_user/review/blocked/failed`（严禁从自由文本猜状态）；跑完即归档销毁；过程静默，仅关键节点唤醒 Chief | Chief 派发真实子任务后，Worker 静默执行、写回 `artifacts` 并销毁，Chief 仅收到一条清晰汇报且上下文零污染 |
-| **R-2.4** | 工具大输出落盘句柄 | `ctrl/artifacts.js` | 超过阈值的工具返回（命令日志、长文件、网页正文）自动写盘至 `<home>/artifacts/`，上下文中仅留摘要 + `artifact://<id>` 句柄与按段翻页读取工具（同时保护 Chief 与 Worker） | 50KB 级工具输出被自动压缩为简短摘要 + 句柄，并能按需分段回查原文 |
+| **R-2.4** | 工具大输出落盘句柄（✅ 已完成 `#7`） | `ctrl/artifacts.js` | 超过阈值的工具返回（命令日志、长文件、网页正文）自动写盘至 `<home>/artifacts/`，上下文中仅留摘要 + `artifact://<id>` 句柄与按段翻页读取工具（同时保护 Chief 与 Worker） | 50KB 级工具输出被自动压缩为简短摘要 + 句柄，并能按需分段回查原文 |
 | **R-2.5** | Mandate 硬拦截、隐藏审批接管与熔断 | `ctrl/mandate-guard.js` + `approvals.js` 薄钩子 | 1. 挂 `tools/pre-execute` 对 Worker 做结构化 Mandate 硬校验（目录白名单、禁跑命令/外发拦截），越权强制转 `waiting_user`；<br>2. 扩展 [approvals.js](../ds-bot/src/host/approvals.js) 接管隐藏 `worker-<ticketId>` 的 `approval/request` 转发给 Chief/通知，防隐藏会话永久挂死；<br>3. 单次 Assignment 步数/Token 熔断 | Worker 触发越权操作或工具审批时，Chief 立即收到可操作审批卡，批准/拒绝后 Worker 正常继续或退出 |
 | **R-2.6** | 分层验收机制 | `ctrl/worker-executor.js` | `review` 阶段支持：① 机器可判定验收（自动跑校验命令/检查产物）→ 通过直转 `done`，失败打回 `in_progress` 附报错；② 独立评审会话；③ 业务/高风险决策弹 `show_view` 交人拍板 | 机器校验未通过时阻止“假完成”并自动打回重做 |
 
