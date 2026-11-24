@@ -841,11 +841,15 @@ export function createTicketStore(dbPath) {
     effectKind = 'dispatch_assignment',
     idempotencyKey = null,
     maxAttempts = 5,
+    extraPayload = {},
     now = Date.now(),
   } = {}) {
     const cleanKey = idempotencyKey === null || idempotencyKey === undefined || String(idempotencyKey).trim() === ''
       ? null
       : cleanText(idempotencyKey, 'idempotency_key', EFFECT_KEY_MAX, { required: true })
+    const extra = extraPayload !== null && typeof extraPayload === 'object' && !Array.isArray(extraPayload)
+      ? extraPayload
+      : {}
 
     return inTransaction(() => {
       if (cleanKey !== null) {
@@ -872,6 +876,7 @@ export function createTicketStore(dbPath) {
         assignmentId: assignment.id,
         idempotencyKey: cleanKey,
         payload: {
+          ...extra,
           assignmentId: assignment.id,
           ticketId: assignment.ticketId,
           priority: assignment.priority,
