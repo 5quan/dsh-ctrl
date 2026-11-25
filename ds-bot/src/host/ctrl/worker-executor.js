@@ -725,6 +725,10 @@ export function createWorkerExecutor(rt, { runCommand = defaultRunCommand, fileE
       turnError: null,
       report: null,
       progressReports: [],
+      pendingApprovals: new Set(),
+      agent: null,
+      mandateViolation: null,
+      circuitBreak: null,
       disposers: [],
     }
     activeWorkers.set(requestedSessionId, workerState)
@@ -752,6 +756,7 @@ export function createWorkerExecutor(rt, { runCommand = defaultRunCommand, fileE
       if (!workerAgent) {
         throw new Error(`Could not resolve live Agent for worker session "${actualSessionId}".`)
       }
+      workerState.agent = workerAgent
 
       stampSubagentOriginIfMutable(workerAgent)
       const route = await resolveModelSelection(requestedModel, ownerBot)
@@ -787,6 +792,10 @@ export function createWorkerExecutor(rt, { runCommand = defaultRunCommand, fileE
       workerState.turnError = workerState.turnError || (error?.message ?? String(error))
       return { workerState, actualSessionId, dir }
     } finally {
+      workerState.agent = null
+      try { rt.cancelApprovals?.(actualSessionId) } catch {}
+      try { rt.mandateGuard?.clearWorkerCalls?.(actualSessionId) } catch {}
+      try { rt.mandateGuard?.clearWorkerCalls?.(requestedSessionId) } catch {}
       for (const dispose of workerState.disposers.splice(0)) {
         try { dispose() } catch {}
       }
@@ -904,6 +913,35 @@ export function createWorkerExecutor(rt, { runCommand = defaultRunCommand, fileE
 
     const progressArts = workerState.progressReports.flatMap(r => r.artifacts)
     const report = workerState.report
+    if (workerState.circuitBreak) {
+      const cb = workerState.circuitBreak
+      const mergedArts = mergeArtifacts(latestTicket.artifacts, progressArts)
+      const updated = store.update(latestTicket.id, {
+        status: 'blocked',
+        blockers: cb.reason.slice(0, SHORT_TEXT_MAX),
+        nextStep: `Inspect progress/artifacts and increase mandate/config ${cb.metric} budget or narrow scope before re-dispatching`,
+        artifacts: mergedArts,
+      })
+      store.completeAssignment(assignment.id, {
+        reportStatus: 'circuit_broken',
+        reportSummary: cb.reason,
+        reportArtifacts: mergedArts,
+        stepCount: cb.stepCount,
+        tokenUsage: cb.tokenUsage,
+        error: cb.reason.slice(0, SHORT_TEXT_MAX),
+        now,
+      })
+      await notifyChief(
+        updated,
+        [
+          `Ticket ${updated.id} (${updated.title}) hit the **circuit breaker** (**${cb.metric}** limit: ${cb.metric === 'steps' ? `${cb.stepCount}/${cb.maxSteps}` : `${cb.tokenUsage}/${cb.maxTokens}`}) and entered **blocked**.`,
+          `Reason: ${cb.reason}`,
+          ...(mergedArts.length > 0 ? [`Artifacts: ${mergedArts.join(', ')}`] : []),
+        ].join('\n\n'),
+        { assignmentId: assignment.id, status: 'blocked', circuitBreak: true, metric: cb.metric },
+      )
+      return
+    }
     if (!report) {
       const mergedArts = mergeArtifacts(latestTicket.artifacts, progressArts)
       const isTurnErr = Boolean(workerState.turnError)
@@ -952,24 +990,34 @@ export function createWorkerExecutor(rt, { runCommand = defaultRunCommand, fileE
         blockers: report.blockers ?? '',
         artifacts: mergedArts,
       })
+      const violation = workerState.mandateViolation
       store.completeAssignment(assignment.id, {
         reportStatus: 'waiting_user',
         reportSummary: report.summary,
         reportArtifacts: report.artifacts,
         stepCount: totalSteps,
         tokenUsage: totalTokens,
+        ...(violation ? { error: violation.reason.slice(0, SHORT_TEXT_MAX) } : {}),
         now,
       })
       await notifyChief(
         updated,
         [
-          `Ticket ${updated.id} (${updated.title}) needs your decision (**waiting_user**).`,
+          violation
+            ? `Ticket ${updated.id} (${updated.title}) was escalated to **waiting_user** by **Mandate Guard** (tool \`${violation.toolName}\`, rule \`${violation.rule}\`).`
+            : `Ticket ${updated.id} (${updated.title}) needs your decision (**waiting_user**).`,
           `Summary: ${report.summary}`,
           ...(updated.nextStep ? [`Next step: ${updated.nextStep}`] : []),
           ...(mergedArts.length > 0 ? [`Artifacts: ${mergedArts.join(', ')}`] : []),
-          'Present a concise `show_view` or `ask_user` card to collect the user\'s decision, then update or re-dispatch the ticket.',
+          violation
+            ? 'Review the blocked operation with the user (`show_view` or `ask_user`), update ticket mandate or instructions if approved, and re-dispatch.'
+            : 'Present a concise `show_view` or `ask_user` card to collect the user\'s decision, then update or re-dispatch the ticket.',
         ].join('\n\n'),
-        { assignmentId: assignment.id, status: 'waiting_user' },
+        {
+          assignmentId: assignment.id,
+          status: 'waiting_user',
+          ...(violation ? { mandateViolation: true, rule: violation.rule, toolName: violation.toolName } : {}),
+        },
       )
       return
     }
@@ -1348,8 +1396,10 @@ export function createWorkerExecutor(rt, { runCommand = defaultRunCommand, fileE
 
     if (event?.type === 'step/end') {
       worker.stepCount += 1
+      rt.mandateGuard?.checkBudget?.(worker)
     } else if (event?.type === 'assistant/message') {
       worker.tokenUsage += extractUsageFromAssistantMessage(event.data?.message)
+      rt.mandateGuard?.checkBudget?.(worker)
     } else if (event?.type === 'turn/end' && event.data?.reason?.kind === 'error') {
       const err = event.data.reason.error
       const code = typeof err?.code === 'string' ? err.code : 'TURN_ERROR'
@@ -1368,6 +1418,7 @@ export function createWorkerExecutor(rt, { runCommand = defaultRunCommand, fileE
     trackWorkerSessionEvent,
     handleDispatchAssignment,
     handleRecoverAssignment,
+    notifyChief,
     runMachineChecks,
     activeWorkerCount: () => activeWorkers.size,
   }
