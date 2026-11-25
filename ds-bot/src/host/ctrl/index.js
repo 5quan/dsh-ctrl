@@ -6,8 +6,9 @@ import * as artifacts from './artifacts.js'
 import * as memoryBridge from './memory-bridge.js'
 import * as dayRollover from './day-rollover.js'
 import * as briefing from './briefing.js'
+import * as workerExecutor from './worker-executor.js'
 
-const CTRL_MODULES = [tickets, ticketQueue, artifacts, memoryBridge, dayRollover, briefing]
+const CTRL_MODULES = [tickets, ticketQueue, artifacts, memoryBridge, dayRollover, briefing, workerExecutor]
 
 export function install(rt) {
   for (const module of CTRL_MODULES) module.install(rt)
