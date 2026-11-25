@@ -624,7 +624,13 @@ test('layered acceptance (R-2.6): machine check failure blocks fake completion a
 
   const doneTicket = h.rt.openTicketStore().get(ticket.id)
   assert.equal(doneTicket.status, 'done')
-  assert.equal(h.retrospectives.length, 1)
+  assert.equal(h.retrospectives.length, 2)
+  const milestoneEntry = h.retrospectives.find(r => r.producer === 'dsh-ctrl/ticket-milestone')
+  const retroEntry = h.retrospectives.find(r => r.producer === 'dsh-ctrl/ticket-retrospective')
+  assert.ok(milestoneEntry, 'auto ticket-milestone note emitted on done')
+  assert.equal(milestoneEntry.target, 'note')
+  assert.match(milestoneEntry.content, new RegExp(`^\\[Ticket ${ticket.id} 完成\\] Build Deliverable：`))
+  assert.ok(retroEntry, 'explicit retrospective coexists with milestone note')
   assert.equal(h.chiefDeliveries.length, 1, 'Chief woken only once when machine acceptance finally passes')
   assert.match(h.chiefDeliveries[0].text, /\*\*done\*\*/)
 })
@@ -809,4 +815,67 @@ test('startup crash recovery resumes interrupted assignment once without loop an
   } finally {
     await ctx2.dispose()
   }
+})
+
+test('scopeWorkerAgentTools dynamically restricts memory_* tools by role without hardcoding full list', async (t) => {
+  const schemas = [
+    { name: 'read_file' },
+    { name: 'memory_search' },
+    { name: 'memory_read_context' },
+    { name: 'memory_forget' },
+    { name: 'memory_mode_set' },
+    { name: 'memory_future_admin' },
+  ]
+  let workerSid = ''
+  let reviewerSid = ''
+
+  const h = setupHarness(t, {
+    workerHandler: async ({ sessionId, callTool }) => {
+      workerSid = sessionId
+      // Simulate late registration via tools/change while Worker is active.
+      schemas.push({ name: 'memory_late_delete' })
+      for (const listener of h.ctx.listeners.get('tools/change') ?? []) listener()
+      await callTool('ticket_report', { status: 'review', summary: 'Worker checked memory sandbox' })
+    },
+    reviewerHandler: async ({ sessionId, callTool }) => {
+      reviewerSid = sessionId
+      await callTool('ticket_report', { status: 'review', summary: 'Reviewer verified cleanly' })
+    },
+  })
+  h.ctx.tools = { schemas: () => schemas }
+
+  await h.runTool('ticket_create', {
+    title: 'Memory Sandbox',
+    goal: 'Check role-based memory tool scoping',
+    acceptance: 'cmd: node -e "process.exit(0)"\nindependent_review: Verify objectively without memory tools',
+  }, 'm1')
+  const ticket = h.rt.openTicketStore().list()[0]
+
+  await h.runTool('ticket_dispatch', { id: ticket.id }, 'm1')
+  await h.rt.ticketQueue.drain()
+
+  assert.equal(h.rt.openTicketStore().get(ticket.id).status, 'done')
+
+  const workerRestricted = h.restrictedToolsBySession.get(workerSid)
+  assert.equal(workerRestricted.includes('memory_search'), false)
+  assert.equal(workerRestricted.includes('memory_read_context'), false)
+  assert.equal(workerRestricted.includes('read_file'), false)
+  assert.ok(workerRestricted.includes('memory_forget'))
+  assert.ok(workerRestricted.includes('memory_mode_set'))
+  assert.ok(workerRestricted.includes('memory_future_admin'))
+  assert.ok(workerRestricted.includes('memory_late_delete'))
+
+  const reviewerRestricted = h.restrictedToolsBySession.get(reviewerSid)
+  assert.equal(reviewerRestricted.includes('read_file'), false)
+  assert.ok(reviewerRestricted.includes('memory_search'))
+  assert.ok(reviewerRestricted.includes('memory_read_context'))
+  assert.ok(reviewerRestricted.includes('memory_forget'))
+  assert.ok(reviewerRestricted.includes('memory_future_admin'))
+  assert.ok(reviewerRestricted.includes('memory_late_delete'))
+
+  // Listeners registered during active sessions must be disposed after exit.
+  const countBefore = workerRestricted.length
+  schemas.push({ name: 'memory_after_exit' })
+  for (const listener of h.ctx.listeners.get('tools/change') ?? []) listener()
+  assert.equal(h.restrictedToolsBySession.get(workerSid).length, countBefore)
 })

@@ -4,13 +4,23 @@
 
 export const DSH_MEMORY_SERVICE = 'dshMemory'
 export const DAY_ROLLED_OVER_EVENT = 'dsh-memory/day-rolled-over'
+export const TICKET_MILESTONE_PRODUCER = 'dsh-ctrl/ticket-milestone'
 
 const EMPTY_MATCH = { totalMatched: 0, matches: [], text: '', estimatedTokens: 0 }
 const RETROSPECTIVE_MAX_CHARS = 1000
 
+function firstSentence(text, max = 180) {
+  const clean = String(text ?? '').replace(/\s+/g, ' ').trim()
+  if (clean === '') return ''
+  const match = /[。！？]|(?<=\S)[.!?](?=\s|$)/.exec(clean)
+  const sentence = match ? clean.slice(0, match.index + 1).trim() : clean
+  return sentence.length <= max ? sentence : `${sentence.slice(0, max - 1)}…`
+}
+
 export function install(rt) {
   const { ctx } = rt
   const rolloverListeners = new Set()
+  const recordedMilestones = new Set()
 
   function getService() {
     try {
@@ -148,6 +158,69 @@ export function install(rt) {
     return { ...res, target: resolvedTarget }
   }
 
+  async function recordTicketMilestone({ ticket, summary, artifacts, sessionId } = {}) {
+    if (!ticket?.id) return { ok: false, reason: 'TICKET_REQUIRED' }
+    if (ticket.status !== 'done') return { ok: false, reason: 'NOT_DONE' }
+    if (ticket.ownerBotId && rt.botOf?.(ticket.ownerBotId)?.private === true) {
+      return { ok: false, reason: 'PRIVATE_BOT' }
+    }
+    if (!isAvailable()) return { ok: false, reason: 'MEMORY_UNAVAILABLE' }
+
+    const metaKey = `ticket-milestone:${ticket.id}`
+    if (recordedMilestones.has(ticket.id)) {
+      return { ok: true, deduplicated: true, target: 'note' }
+    }
+    if (rt.hasTicketStore?.()) {
+      try {
+        const prev = rt.openTicketStore().getMeta(metaKey)
+        if (prev?.recordedAt) {
+          recordedMilestones.add(ticket.id)
+          return { ok: true, deduplicated: true, id: prev.bufferId, target: 'note' }
+        }
+      } catch {}
+    }
+
+    const cleanTitle = String(ticket.title ?? ticket.id).replace(/\s+/g, ' ').trim().slice(0, 80)
+    const lead = firstSentence(summary) || firstSentence(ticket.goal) || '已完成'
+    const artSeen = new Set()
+    const artList = []
+    for (const raw of [
+      ...(Array.isArray(artifacts) ? artifacts : []),
+      ...(Array.isArray(ticket.artifacts) ? ticket.artifacts : []),
+    ]) {
+      const clean = typeof raw === 'string' ? raw.trim() : ''
+      if (clean === '' || artSeen.has(clean)) continue
+      artSeen.add(clean)
+      artList.push(clean)
+      if (artList.length >= 3) break
+    }
+    const rawLine = artList.length > 0
+      ? `[Ticket ${ticket.id} 完成] ${cleanTitle}：${lead}（产物：${artList.join(', ')}）`
+      : `[Ticket ${ticket.id} 完成] ${cleanTitle}：${lead}`
+    const content = rawLine.slice(0, RETROSPECTIVE_MAX_CHARS)
+
+    const res = await submitBufferCandidate({
+      content,
+      target: 'note',
+      sourceType: 'extracted',
+      sessionId,
+      producer: TICKET_MILESTONE_PRODUCER,
+    })
+    if (res?.ok === true) {
+      recordedMilestones.add(ticket.id)
+      if (rt.hasTicketStore?.()) {
+        try {
+          rt.openTicketStore().setMeta(metaKey, {
+            recordedAt: Date.now(),
+            bufferId: res.id ?? '',
+            status: res.status ?? '',
+          })
+        } catch {}
+      }
+    }
+    return { ...res, target: 'note', deduplicated: false }
+  }
+
   function onDayRolledOver(listener) {
     if (typeof listener !== 'function') return () => {}
     rolloverListeners.add(listener)
@@ -175,6 +248,7 @@ export function install(rt) {
     matchLessons,
     submitBufferCandidate,
     submitTicketRetrospective,
+    recordTicketMilestone,
     onDayRolledOver,
   }
 }

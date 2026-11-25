@@ -16,6 +16,9 @@ import { output } from '../tools.js'
 import { TERMINAL_TICKET_STATUSES } from './tickets.js'
 
 export const WORKER_REPORT_STATUSES = ['progress', 'waiting_user', 'review', 'blocked', 'failed']
+export const WORKER_ALLOWED_MEMORY_TOOLS = ['memory_search', 'memory_read_context']
+
+const WORKER_ALLOWED_MEMORY_TOOL_SET = new Set(WORKER_ALLOWED_MEMORY_TOOLS)
 
 const HIDDEN_WORKER_TOOLS = [
   'ask_user_question',
@@ -593,6 +596,29 @@ export function createWorkerExecutor(rt, { runCommand = defaultRunCommand, fileE
     })
   }
 
+  function restrictMemoryTools(workerAgent, workerState) {
+    const toolCtx = workerAgent?.ctx?.tools
+    if (typeof toolCtx?.restrict !== 'function' || typeof ctx.tools?.schemas !== 'function') return
+    let schemas
+    try {
+      schemas = ctx.tools.schemas(workerAgent)
+    } catch {
+      return
+    }
+    if (!Array.isArray(schemas)) return
+    for (const schema of schemas) {
+      const name = schema?.name
+      if (typeof name !== 'string' || !name.startsWith('memory_')) continue
+      if (workerState.kind !== 'reviewer' && WORKER_ALLOWED_MEMORY_TOOL_SET.has(name)) continue
+      if (workerState.deniedMemoryTools?.has(name)) continue
+      try {
+        const lift = toolCtx.restrict({ deny: [name] })
+        if (typeof lift === 'function') workerState.disposers.push(lift)
+        workerState.deniedMemoryTools?.add(name)
+      } catch {}
+    }
+  }
+
   function scopeWorkerAgentTools(workerAgent, workerState) {
     const toolCtx = workerAgent?.ctx?.tools
     if (typeof toolCtx?.register === 'function') {
@@ -620,6 +646,16 @@ export function createWorkerExecutor(rt, { runCommand = defaultRunCommand, fileE
           if (typeof lift === 'function') workerState.disposers.push(lift)
         } catch {}
       }
+    }
+    restrictMemoryTools(workerAgent, workerState)
+    if (typeof ctx.on === 'function') {
+      let disposed = false
+      const offToolsChange = ctx.on('tools/change', () => {
+        if (disposed || !activeWorkers.has(workerState.sessionId)) return
+        restrictMemoryTools(workerAgent, workerState)
+      })
+      workerState.disposers.push(() => { disposed = true })
+      if (typeof offToolsChange === 'function') workerState.disposers.push(offToolsChange)
     }
   }
 
@@ -726,6 +762,7 @@ export function createWorkerExecutor(rt, { runCommand = defaultRunCommand, fileE
       report: null,
       progressReports: [],
       pendingApprovals: new Set(),
+      deniedMemoryTools: new Set(),
       agent: null,
       mandateViolation: null,
       circuitBreak: null,
@@ -1223,6 +1260,13 @@ export function createWorkerExecutor(rt, { runCommand = defaultRunCommand, fileE
         tokenUsage: combinedTokens,
         now,
       })
+      if (!ownerIsPrivate) {
+        await rt.memoryBridge?.recordTicketMilestone?.({
+          ticket: doneTicket,
+          summary: report.summary,
+          artifacts: finalArtifacts,
+        }).catch(() => {})
+      }
       const retroSuffix = await submitRetrospectiveIfRequested(doneTicket, report, ownerIsPrivate)
       await notifyChief(
         doneTicket,

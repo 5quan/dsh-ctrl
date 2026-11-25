@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -160,4 +160,53 @@ test('createArtifactStore handles empty/zero threshold edge inputs safely', (t) 
   assert.equal(store.readRaw(meta.id), 'alpha\nbeta')
   assert.equal(store.readPage(meta.handle, { startLine: 2, endLine: 2 }).text, 'beta')
   assert.equal(store.readPage(meta.handle, { query: 'missing' }).totalMatches, 0)
+})
+
+test('pruneExpired and pruneOrphans delete expired unreferenced artifacts while preserving referenced ones and lazy tickets.sqlite', (t) => {
+  const freshTeam = startTeam(t, { ctrl: { artifactRetentionDays: 14, artifactGcStartupDelayMs: 60_000 } })
+  const now = Date.now()
+  const dayMs = 86_400_000
+
+  // Empty/lazy runtime without tickets.sqlite: pruneOrphans works and never creates tickets.sqlite.
+  const preMeta = freshTeam.rt.artifacts.save('stale pre-ticket log', { toolName: 'bash', now: now - 20 * dayMs })
+  const preRes = freshTeam.rt.artifacts.pruneOrphans({ now })
+  assert.equal(preRes.deleted, 1)
+  assert.equal(existsSync(join(freshTeam.home, 'tickets.sqlite')), false, 'GC must preserve lazy tickets.sqlite invariant')
+  assert.equal(freshTeam.rt.artifacts.readRaw(preMeta.id), undefined)
+
+  // With ticket store open: active tickets, closed tickets, and assignments keep their referenced artifacts past TTL.
+  const store = freshTeam.rt.openTicketStore()
+  const artActive = freshTeam.rt.artifacts.save('active ticket artifact', { now: now - 30 * dayMs })
+  const artClosed = freshTeam.rt.artifacts.save('done ticket artifact', { now: now - 30 * dayMs })
+  const artAsg = freshTeam.rt.artifacts.save('assignment artifact', { now: now - 30 * dayMs })
+  const artOrphanOld = freshTeam.rt.artifacts.save('expired orphan', { now: now - 20 * dayMs })
+  const artOrphanFresh = freshTeam.rt.artifacts.save('fresh orphan', { now: now - 2 * dayMs })
+
+  // Also test meta-less orphan falling back to file mtime.
+  const artTxtOnly = freshTeam.rt.artifacts.save('meta-less stale txt', { now: now - 20 * dayMs })
+  rmSync(join(freshTeam.rt.artifacts.dir, `${artTxtOnly.id}.json`), { force: true })
+  const staleSec = (now - 20 * dayMs) / 1000
+  utimesSync(join(freshTeam.rt.artifacts.dir, `${artTxtOnly.id}.txt`), staleSec, staleSec)
+
+  store.create({ title: 'Active', goal: 'G1', ownerBotId: 'm1', createdByBotId: 'm1', artifacts: [artActive.handle] })
+  const closed = store.create({ title: 'Closed', goal: 'G2', ownerBotId: 'm1', createdByBotId: 'm1', artifacts: [`log in ${artClosed.handle}`] })
+  const asg = store.createAssignment({ ticketId: closed.id, prompt: 'work' })
+  store.completeAssignment(asg.id, { reportStatus: 'done', reportSummary: 'ok', reportArtifacts: [artAsg.handle] })
+  store.update(closed.id, { status: 'done' })
+
+  const gcRes = freshTeam.rt.artifacts.pruneOrphans({ now })
+  assert.deepEqual(gcRes, {
+    scanned: 6,
+    deleted: 2,
+    keptReferenced: 3,
+    keptFresh: 1,
+    errors: 0,
+  })
+  assert.equal(freshTeam.rt.artifacts.readRaw(artActive.id), 'active ticket artifact')
+  assert.equal(freshTeam.rt.artifacts.readRaw(artClosed.id), 'done ticket artifact')
+  assert.equal(freshTeam.rt.artifacts.readRaw(artAsg.id), 'assignment artifact')
+  assert.equal(freshTeam.rt.artifacts.readRaw(artOrphanFresh.id), 'fresh orphan')
+  assert.equal(freshTeam.rt.artifacts.readRaw(artOrphanOld.id), undefined)
+  assert.equal(existsSync(join(freshTeam.rt.artifacts.dir, `${artOrphanOld.id}.json`)), false)
+  assert.equal(freshTeam.rt.artifacts.readRaw(artTxtOnly.id), undefined)
 })

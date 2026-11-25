@@ -2,14 +2,18 @@
 // <home>/artifacts/, leaves a concise summary + artifact://<id> handle in
 // conversation context, and serves paginated/line/query inspection via artifact_read.
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { output } from '../tools.js'
 
 export const ARTIFACT_PREFIX = 'artifact://'
+export const DEFAULT_ARTIFACT_RETENTION_DAYS = 14
+export const DEFAULT_ARTIFACT_GC_INTERVAL_MS = 6 * 60 * 60 * 1000
+export const DEFAULT_ARTIFACT_GC_STARTUP_DELAY_MS = 30_000
 
 const ARTIFACT_ID_RE = /^art-[a-z0-9-]+$/i
+const ARTIFACT_FILENAME_RE = /^(art-[a-z0-9-]+)\.(txt|json)$/i
 const DEFAULT_THRESHOLD_CHARS = 12_000
 const DEFAULT_HEAD_CHARS = 1200
 const DEFAULT_TAIL_CHARS = 600
@@ -241,6 +245,81 @@ export function createArtifactStore({
     }
   }
 
+  function pruneExpired({
+    retentionDays = DEFAULT_ARTIFACT_RETENTION_DAYS,
+    now = Date.now(),
+    referencedHandles = [],
+  } = {}) {
+    if (!existsSync(dir) || typeof retentionDays !== 'number' || !Number.isFinite(retentionDays) || retentionDays <= 0) {
+      return { scanned: 0, deleted: 0, keptReferenced: 0, keptFresh: 0, errors: 0 }
+    }
+
+    const referencedIds = new Set()
+    for (const rawEntry of referencedHandles) {
+      if (typeof rawEntry !== 'string') continue
+      const directId = parseArtifactHandle(rawEntry)
+      if (directId !== undefined) referencedIds.add(directId.toLowerCase())
+      const inlineRe = /artifact:\/\/(art-[a-z0-9-]+)/gi
+      let match
+      while ((match = inlineRe.exec(rawEntry)) !== null) {
+        referencedIds.add(match[1].toLowerCase())
+      }
+    }
+
+    const cutoff = now - retentionDays * 86_400_000
+    const ids = new Set()
+    for (const fileName of readdirSync(dir)) {
+      const m = ARTIFACT_FILENAME_RE.exec(fileName)
+      if (m) ids.add(m[1])
+    }
+
+    let scanned = 0
+    let deleted = 0
+    let keptReferenced = 0
+    let keptFresh = 0
+    let errors = 0
+
+    for (const id of ids) {
+      scanned += 1
+      if (referencedIds.has(id.toLowerCase())) {
+        keptReferenced += 1
+        continue
+      }
+
+      const textPath = textPathOf(id)
+      const metaPath = metaPathOf(id)
+      const meta = getMeta(id)
+      let createdAt = typeof meta?.createdAt === 'number' && Number.isFinite(meta.createdAt) ? meta.createdAt : null
+      if (createdAt === null) {
+        for (const p of [textPath, metaPath]) {
+          try {
+            const st = statSync(p)
+            createdAt = createdAt === null ? st.mtimeMs : Math.max(createdAt, st.mtimeMs)
+          } catch {}
+        }
+      }
+      if (createdAt !== null && createdAt >= cutoff) {
+        keptFresh += 1
+        continue
+      }
+
+      let failed = false
+      for (const p of [textPath, metaPath]) {
+        try {
+          unlinkSync(p)
+        } catch (err) {
+          if (err?.code !== 'ENOENT') {
+            failed = true
+            errors += 1
+          }
+        }
+      }
+      if (!failed) deleted += 1
+    }
+
+    return { scanned, deleted, keptReferenced, keptFresh, errors }
+  }
+
   return {
     dir,
     thresholdChars: safeThreshold,
@@ -249,6 +328,7 @@ export function createArtifactStore({
     readRaw,
     readPage,
     offloadContent,
+    pruneExpired,
   }
 }
 
@@ -277,6 +357,19 @@ export function install(rt) {
     headChars: ctrlConfig.artifactHeadChars,
     tailChars: ctrlConfig.artifactTailChars,
   })
+  const retentionDays = typeof ctrlConfig.artifactRetentionDays === 'number' && Number.isFinite(ctrlConfig.artifactRetentionDays)
+    ? ctrlConfig.artifactRetentionDays
+    : DEFAULT_ARTIFACT_RETENTION_DAYS
+
+  function pruneOrphans({ retentionDays: overrideDays = retentionDays, now = Date.now() } = {}) {
+    const referencedHandles = rt.hasTicketStore?.() ? rt.openTicketStore().listReferencedArtifacts() : []
+    return store.pruneExpired({
+      retentionDays: overrideDays,
+      now,
+      referencedHandles,
+    })
+  }
+  store.pruneOrphans = pruneOrphans
 
   ctx.on('tools/post-execute', async function offloadLargeToolOutput(exec, result, next) {
     const decision = await next()
@@ -308,6 +401,31 @@ export function install(rt) {
       content: offloaded.content,
     }
   })
+
+  ctx.effect(() => {
+    if (!(retentionDays > 0)) return undefined
+    const intervalMs = Number.isInteger(ctrlConfig.artifactGcIntervalMs) && ctrlConfig.artifactGcIntervalMs > 0
+      ? ctrlConfig.artifactGcIntervalMs
+      : DEFAULT_ARTIFACT_GC_INTERVAL_MS
+    const startupDelayMs = Number.isInteger(ctrlConfig.artifactGcStartupDelayMs) && ctrlConfig.artifactGcStartupDelayMs >= 0
+      ? ctrlConfig.artifactGcStartupDelayMs
+      : DEFAULT_ARTIFACT_GC_STARTUP_DELAY_MS
+    const runSweep = () => {
+      try {
+        pruneOrphans()
+      } catch (error) {
+        rt.warn?.('ds-bot: artifact gc failed: %s', error?.message ?? error)
+      }
+    }
+    const startupTimer = setTimeout(runSweep, startupDelayMs)
+    startupTimer.unref?.()
+    const intervalTimer = setInterval(runSweep, intervalMs)
+    intervalTimer.unref?.()
+    return () => {
+      clearTimeout(startupTimer)
+      clearInterval(intervalTimer)
+    }
+  }, 'ds-bot: artifact gc')
 
   rt.teamTools.push(defineTool({
     name: 'artifact_read',

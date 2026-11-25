@@ -5,9 +5,29 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { REPLY_KIND } from '../constants.js'
 import { output } from '../tools.js'
+import { TICKET_MILESTONE_PRODUCER } from './memory-bridge.js'
 
 const ACTION_ENUM = ['get', 'confirm', 'dismiss']
 const BRIEFING_SOURCE_KIND = 'dsh-ctrl/briefing'
+
+function stripAutoMilestoneNotes(memory) {
+  if (!memory?.buffer || !Array.isArray(memory.buffer.pending)) return memory
+  const filtered = memory.buffer.pending.filter(
+    item => !(item?.target === 'note' && item?.producer === TICKET_MILESTONE_PRODUCER),
+  )
+  if (filtered.length === memory.buffer.pending.length) return memory
+  const approved = Array.isArray(memory.buffer.approved) ? memory.buffer.approved : []
+  const yesterdayHasContent = Boolean(memory.yesterday?.highlights?.hasContent)
+  return {
+    ...memory,
+    hasContent: yesterdayHasContent || filtered.length > 0 || approved.length > 0,
+    buffer: {
+      ...memory.buffer,
+      pending: filtered,
+      totalPending: filtered.length,
+    },
+  }
+}
 
 function localDateToday(timeZone) {
   try {
@@ -146,7 +166,8 @@ export function install(rt) {
 
   function getUnifiedBriefing({ botId, date, scope = 'default', now = Date.now() } = {}) {
     const todayDate = date || rt.memoryBridge?.getCurrentLogicalDate?.() || localDateToday(rt.config?.timeZone)
-    const memory = rt.memoryBridge?.getMorningBriefing?.({ date: todayDate, scope }) ?? null
+    const rawMemory = rt.memoryBridge?.getMorningBriefing?.({ date: todayDate, scope }) ?? null
+    const memory = stripAutoMilestoneNotes(rawMemory)
     const tickets = collectTicketBriefing(botId, todayDate, now)
     const alreadyDelivered = isDeliveredLocally(scope, todayDate) || (Boolean(memory?.alreadyDelivered) && !tickets.hasAttention)
     const hasContent = Boolean(memory?.hasContent || tickets.hasAttention)
