@@ -75,6 +75,7 @@ test('apply registers listeners and effects in a fixed order', (t) => {
     'effect ds-bot: worker identity section',
     'prompt ctrl-worker 642',
     'on session/event',
+    'on tools/pre-execute',
     'on approval/request (prepend)',
     'on agent/inbox/discarded',
     'on session/event',

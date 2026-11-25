@@ -26,31 +26,40 @@ export function install(rt) {
   ctx.on('approval/request', (request, next) => {
     const sessionId = request.agent?.session?.id ?? request.agent?.id
     const owner = sessionId === undefined ? undefined : rt.groupOwners.get(sessionId)
-    const botId = owner?.botId ?? (sessionId === undefined ? undefined : rt.chatOwners.get(sessionId))
+    const worker = sessionId === undefined || owner !== undefined ? undefined : rt.workerContextOf?.(sessionId)
+    const botId = owner?.botId
+      ?? (sessionId === undefined ? undefined : rt.chatOwners.get(sessionId))
+      ?? (worker ? (worker.ownerBotId || rt.state?.mainBotIds?.[0] || 'chief') : undefined)
     if (botId === undefined) return next()
     const id = randomUUID()
+    const detail = worker
+      ? (rt.workerCallDetail?.(sessionId, request.callId) ?? rt.callDetail?.(sessionId, request.callId) ?? {})
+      : (rt.callDetail?.(sessionId, request.callId) ?? {})
     const entry = {
       id,
       sessionId,
       botId,
       ...(owner ? { roomId: owner.roomId } : {}),
+      ...(worker ? { worker: true, ticketId: worker.ticketId, assignmentId: worker.assignmentId } : {}),
       tool: String(request.toolName ?? ''),
       reason: String(request.reason ?? '').slice(0, 500),
-      detail: rt.callDetail?.(sessionId, request.callId) ?? {},
+      detail,
       at: Date.now(),
     }
     pending.set(id, entry)
     rt.noteApproval?.(sessionId, { tool: entry.tool, reason: entry.reason.slice(0, 200) })
     rt.approvalWaiting?.(entry)
     emit('open', { ...entry, answerable: true })
+    if (worker) rt.workerApprovalChanged?.('open', entry)
     const settle = (outcome) => {
       if (!pending.has(id)) return false
       pending.delete(id)
       rt.noteApproval?.(sessionId, undefined)
       emit('settled', { id, outcome })
+      if (worker) rt.workerApprovalChanged?.('settled', { ...entry, outcome })
       return true
     }
-    if (owner === undefined) {
+    if (owner === undefined && worker === undefined) {
       // An own-chat approval races DSH's card. The card sees `linked`, our own
       // AbortSignal: answering here resolves the request, then withdraws the card;
       // an answer there settles `next()` first and is adopted. An abort of the
@@ -84,7 +93,7 @@ export function install(rt) {
         )
       })
     }
-    rt.yieldRoomTurn?.(sessionId)
+    if (owner !== undefined) rt.yieldRoomTurn?.(sessionId)
     return new Promise((resolve) => {
       entry.answer = (outcome) => {
         if (!settle(outcome)) return
