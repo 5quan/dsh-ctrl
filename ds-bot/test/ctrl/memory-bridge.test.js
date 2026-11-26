@@ -125,7 +125,11 @@ test('ticket_update retrospective queues candidates on done/failed, enforces pri
     retrospective: 'Port 8080 serves healthcheck.',
   }, 'm1')
   assert.match(doneDefault, /target: note, status: pending/)
-  assert.equal(submitted[1].target, 'note')
+  const retroItems = () => submitted.filter(item => item.producer === 'dsh-ctrl/ticket-retrospective')
+  const milestoneItems = () => submitted.filter(item => item.producer === 'dsh-ctrl/ticket-milestone')
+  assert.equal(retroItems().length, 2)
+  assert.equal(retroItems()[1].target, 'note')
+  assert.equal(milestoneItems().length, 1)
 
   const t3Out = await run('ticket_create', { title: 'Update Server A IP', goal: 'Record IP' }, 'm1')
   const t3 = /Ticket (tkt-[0-9a-f]{8})/.exec(t3Out)[1]
@@ -136,9 +140,11 @@ test('ticket_update retrospective queues candidates on done/failed, enforces pri
     retrospective_target: 'entity:ServerA',
   }, 'm1')
   assert.match(doneEntity, /target: entity:ServerA, status: pending/)
-  assert.equal(submitted[2].target, 'entity:ServerA')
+  assert.equal(retroItems().length, 3)
+  assert.equal(retroItems()[2].target, 'entity:ServerA')
+  assert.equal(milestoneItems().length, 2)
 
-  // 3. Private Bot ticket never leaks retrospective to shared dsh-memory.
+  // 3. Private Bot ticket never leaks retrospective or milestone note to shared dsh-memory.
   const privOut = await run('ticket_create', { title: 'Private Secret', goal: 'Personal' }, 'p1')
   const privId = /Ticket (tkt-[0-9a-f]{8})/.exec(privOut)[1]
   const privDone = await run('ticket_update', {
@@ -147,7 +153,8 @@ test('ticket_update retrospective queues candidates on done/failed, enforces pri
     retrospective: 'Sensitive personal detail',
   }, 'p1')
   assert.match(privDone, /Retrospective skipped: private Bot tickets do not write to shared dsh-memory/)
-  assert.equal(submitted.length, 3)
+  assert.equal(retroItems().length, 3)
+  assert.equal(milestoneItems().length, 2)
 
   // 4. Absent dshMemory service still commits ticket update cleanly.
   const noMem = startTeam(t)
@@ -160,4 +167,75 @@ test('ticket_update retrospective queues candidates on done/failed, enforces pri
   }, 'm1')
   assert.match(offlineDone, /Status: done/)
   assert.match(offlineDone, /Memory buffer skipped \(MEMORY_UNAVAILABLE\)/)
+})
+
+test('recordTicketMilestone writes single-line note for non-private done tickets, deduplicates, and degrades safely', async (t) => {
+  const submitted = []
+  const dshMemory = {
+    contractVersion: 1,
+    getCurrentLogicalDate: () => '2026-11-25',
+    submitBufferCandidate: async input => {
+      submitted.push(input)
+      return { ok: true, id: `buf_ms_${submitted.length}`, status: 'pending' }
+    },
+  }
+
+  const { rt, run } = startTeam(t, { services: { dshMemory } })
+
+  // Non-done tickets do not record milestones.
+  const openOut = await run('ticket_create', { title: 'Open Task', goal: 'Keep waiting' }, 'm1')
+  const openId = /Ticket (tkt-[0-9a-f]{8})/.exec(openOut)[1]
+  const store = rt.openTicketStore()
+  const notDone = await rt.memoryBridge.recordTicketMilestone({ ticket: store.get(openId) })
+  assert.deepEqual(notDone, { ok: false, reason: 'NOT_DONE' })
+
+  // Private ticket does not leak milestone.
+  const privOut = await run('ticket_create', { title: 'Secret Note', goal: 'Private delivery' }, 'p1')
+  const privId = /Ticket (tkt-[0-9a-f]{8})/.exec(privOut)[1]
+  await run('ticket_update', { id: privId, status: 'done' }, 'p1')
+  assert.equal(submitted.length, 0)
+
+  // Done ticket formats single-line concise note with artifacts and persists idempotency meta.
+  const tktOut = await run('ticket_create', {
+    title: 'Deploy API Gateway',
+    goal: 'Switch production ingress to v2 gateway',
+    artifacts: ['docs/gateway.md', 'artifact://art-1111'],
+  }, 'm1')
+  const tktId = /Ticket (tkt-[0-9a-f]{8})/.exec(tktOut)[1]
+  const doneRes = await run('ticket_update', { id: tktId, status: 'done' }, 'm1')
+  assert.match(doneRes, /Status: done/)
+  assert.equal(submitted.length, 1)
+  assert.equal(submitted[0].target, 'note')
+  assert.equal(submitted[0].sourceType, 'extracted')
+  assert.equal(submitted[0].producer, 'dsh-ctrl/ticket-milestone')
+  assert.equal(submitted[0].content, `[Ticket ${tktId} 完成] Deploy API Gateway：Switch production ingress to v2 gateway（产物：docs/gateway.md, artifact://art-1111）`)
+  assert.ok(store.getMeta(`ticket-milestone:${tktId}`)?.recordedAt)
+
+  // Re-invoking for same ticket is deduplicated across both memory and SQLite meta.
+  const dup = await rt.memoryBridge.recordTicketMilestone({
+    ticket: store.get(tktId),
+    summary: 'Should not duplicate.',
+  })
+  assert.equal(dup.ok, true)
+  assert.equal(dup.deduplicated, true)
+  assert.equal(submitted.length, 1)
+
+  // First-sentence extraction handles multi-sentence summaries cleanly.
+  const tkt2Out = await run('ticket_create', { title: 'Clean Logs', goal: 'Trim logs' }, 'm1')
+  const tkt2Id = /Ticket (tkt-[0-9a-f]{8})/.exec(tkt2Out)[1]
+  store.update(tkt2Id, { status: 'done' })
+  await rt.memoryBridge.recordTicketMilestone({
+    ticket: store.get(tkt2Id),
+    summary: '已清理全部 14 天前日志。随后验证了磁盘水位正常。',
+    artifacts: ['reports/gc.txt'],
+  })
+  assert.equal(submitted.length, 2)
+  assert.equal(submitted[1].content, `[Ticket ${tkt2Id} 完成] Clean Logs：已清理全部 14 天前日志。（产物：reports/gc.txt）`)
+
+  // Absent dshMemory degrades without throwing.
+  const offline = startTeam(t)
+  const offRes = await offline.rt.memoryBridge.recordTicketMilestone({
+    ticket: { id: 'tkt-offline', title: 'Offline', goal: 'Work', status: 'done', ownerBotId: 'm1', artifacts: [] },
+  })
+  assert.deepEqual(offRes, { ok: false, reason: 'MEMORY_UNAVAILABLE' })
 })

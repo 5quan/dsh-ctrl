@@ -932,11 +932,32 @@ export function createTicketStore(dbPath) {
     })
   }
 
+  function listReferencedArtifacts() {
+    const seen = new Set()
+    const collect = (rawJson) => {
+      if (typeof rawJson !== 'string' || rawJson === '' || rawJson === '[]') return
+      try {
+        const arr = JSON.parse(rawJson)
+        if (!Array.isArray(arr)) return
+        for (const item of arr) {
+          const clean = typeof item === 'string' ? item.trim() : ''
+          if (clean !== '') seen.add(clean)
+        }
+      } catch {}
+    }
+    const ticketRows = db.prepare("SELECT artifacts FROM tickets WHERE artifacts <> '[]' AND artifacts <> ''").all()
+    for (const row of ticketRows) collect(row.artifacts)
+    const assignmentRows = db.prepare("SELECT report_artifacts FROM assignments WHERE report_artifacts <> '[]' AND report_artifacts <> ''").all()
+    for (const row of assignmentRows) collect(row.report_artifacts)
+    return [...seen]
+  }
+
   return {
     create,
     get,
     list,
     listDue,
+    listReferencedArtifacts,
     update,
     createAssignment,
     getAssignment,
@@ -1220,6 +1241,16 @@ export function install(rt) {
           expectedRevision: args.expected_revision,
         })
         let suffix = ''
+        if (updated.status === 'done' && existing.status !== 'done' && !isPrivate(updated.ownerBotId)) {
+          try {
+            await rt.memoryBridge?.recordTicketMilestone?.({
+              ticket: updated,
+              summary: updated.goal,
+              artifacts: updated.artifacts,
+              sessionId: exec.agent?.id,
+            })
+          } catch {}
+        }
         if (typeof args.retrospective === 'string' && args.retrospective.trim() !== '') {
           if (updated.status !== 'done' && updated.status !== 'failed') {
             suffix = '\nRetrospective skipped: only recorded when status transitions to "done" or "failed".'

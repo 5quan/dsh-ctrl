@@ -65,11 +65,11 @@ function createFakeMemory({ date = '2026-11-24', pending = [], highlights = null
   return { service, confirmCalls, markCalls, isDelivered: () => deliveredDate === date }
 }
 
-function startTeam(t, { services } = {}) {
+function startTeam(t, { services, memory = false } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-briefing-'))
   writeFileSync(join(home, 'state.json'), JSON.stringify(TEAM))
   const ctx = fakeContext({ services })
-  const rt = createRuntime(ctx, { home, memory: false })
+  const rt = createRuntime(ctx, { home, memory })
   t.after(async () => {
     await ctx.dispose()
     rmSync(home, { recursive: true, force: true, maxRetries: 5 })
@@ -216,4 +216,72 @@ test('ctrl_briefing tool enforces permissions and delegates confirm/dismiss', as
 
   const dismissed = await run('ctrl_briefing', { action: 'dismiss', date: '2026-11-24' }, 'm1')
   assert.match(dismissed, /Dismissed unified briefing for 2026-11-24/)
+})
+
+test('same-day ctrl_briefing filters auto ticket-milestone notes while preserving regular notes', async (t) => {
+  const mem = createFakeMemory({
+    date: '2026-11-25',
+    pending: [
+      {
+        id: 'buf_auto',
+        logical_date: '2026-11-25',
+        source_type: 'extracted',
+        target: 'note',
+        producer: 'dsh-ctrl/ticket-milestone',
+        content: '[Ticket tkt-1111 完成] Build API：Done.',
+      },
+      {
+        id: 'buf_user',
+        logical_date: '2026-11-25',
+        source_type: 'extracted',
+        target: 'note',
+        producer: 'dsh-memory/extract',
+        content: 'Remember to renew cert tomorrow',
+      },
+    ],
+  })
+  const { rt, run } = startTeam(t, { services: { dshMemory: mem.service } })
+  const briefing = rt.ctrlBriefing.getUnifiedBriefing({ botId: 'm1', date: '2026-11-25' })
+  assert.equal(briefing.memory.buffer.pending.length, 1)
+  assert.equal(briefing.memory.buffer.pending[0].id, 'buf_user')
+  assert.equal(briefing.memory.buffer.totalPending, 1)
+
+  const toolText = await run('ctrl_briefing', { action: 'get', date: '2026-11-25' }, 'm1')
+  assert.doesNotMatch(toolText, /buf_auto/)
+  assert.match(toolText, /buf_user/)
+
+  // When only auto milestone notes exist and no yesterday highlights/tickets exist, hasContent is false.
+  const autoOnly = createFakeMemory({
+    date: '2026-11-25',
+    pending: [
+      {
+        id: 'buf_only_auto',
+        logical_date: '2026-11-25',
+        source_type: 'extracted',
+        target: 'note',
+        producer: 'dsh-ctrl/ticket-milestone',
+        content: '[Ticket tkt-2222 完成] Sync：Done.',
+      },
+    ],
+  })
+  const quiet = startTeam(t, { services: { dshMemory: autoOnly.service } })
+  const quietBriefing = quiet.rt.ctrlBriefing.getUnifiedBriefing({ botId: 'm1', date: '2026-11-25' })
+  assert.equal(quietBriefing.hasContent, false)
+})
+
+test('prompt.js guides memory_search primary usage when external memory is active and preserves builtin read_own_chat otherwise', (t) => {
+  const builtin = startTeam(t, { memory: true })
+  const builtinPrompt = builtin.ctx.sections.get('bot-identity').text({ agent: { id: 'm1' } })
+  assert.match(builtinPrompt, /call read_own_chat with words to look for/)
+  assert.doesNotMatch(builtinPrompt, /call memory_search/)
+
+  const mem = createFakeMemory({ date: '2026-11-25' })
+  const withExternal = startTeam(t, { services: { dshMemory: mem.service }, memory: true })
+  const externalPrompt = withExternal.ctx.sections.get('bot-identity').text({ agent: { id: 'm1' } })
+  assert.match(externalPrompt, /call memory_search \(with 2–3 short core keywords\) and memory_read_context first/)
+  assert.match(externalPrompt, /Use read_own_chat only to inspect an earlier part's "\[Handoff · part N\]" note/)
+
+  const disabledBuiltin = startTeam(t, { memory: false })
+  const disabledPrompt = disabledBuiltin.ctx.sections.get('bot-identity').text({ agent: { id: 'm1' } })
+  assert.match(disabledPrompt, /call memory_search/)
 })
