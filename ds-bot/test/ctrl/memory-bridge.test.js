@@ -239,3 +239,116 @@ test('recordTicketMilestone writes single-line note for non-private done tickets
   })
   assert.deepEqual(offRes, { ok: false, reason: 'MEMORY_UNAVAILABLE' })
 })
+
+test('buildHandoffMemoryWarmup recalls entities and lessons on intra-day heavy part handoff while respecting privacy and dayRollover', async (t) => {
+  const probeCalls = []
+  const fakeMemory = {
+    matchEntities: (text, opts) => {
+      probeCalls.push(['entities', text, opts])
+      if (!/server a/i.test(text)) return { totalMatched: 0, matches: [], text: '', estimatedTokens: 0 }
+      return { totalMatched: 1, matches: [{ slug: 'server-a' }], text: '### Server A\n- Host: 10.0.0.8', estimatedTokens: 12 }
+    },
+    matchLessons: (text, opts) => {
+      probeCalls.push(['lessons', text, opts])
+      if (!/nginx/i.test(text)) return { totalMatched: 0, matches: [], text: '', estimatedTokens: 0 }
+      return { totalMatched: 1, matches: [{ slug: 'nginx-reload' }], text: '### Nginx\n- Run nginx -t before reload', estimatedTokens: 14 }
+    },
+  }
+
+  // Unit coverage for buildHandoffMemoryWarmup.
+  const offline = startTeam(t)
+  assert.equal(offline.rt.handoffMemoryWarmup({ botId: 'm1', recentLines: ['Check Server A nginx'] }), undefined)
+
+  const { home, ctx, rt } = startTeam(t, { services: { dshMemory: fakeMemory } })
+  assert.equal(rt.handoffMemoryWarmup({ botId: 'p1', recentLines: ['Check Server A nginx'] }), undefined, 'private Bot never recalls shared memory')
+  assert.equal(rt.handoffMemoryWarmup({ botId: 'm1', recentLines: ['unrelated weather chat'] }), undefined)
+
+  const warmup = rt.handoffMemoryWarmup({ botId: 'm1', recentLines: ['Deploy Server A with nginx'] })
+  assert.match(warmup, /### Referenced Entities[\s\S]*Server A/)
+  assert.match(warmup, /### Relevant Lessons[\s\S]*Run nginx -t before reload/)
+
+  // Integration check: intra-day rt.newPart injects ## Recalled memory context from recent messages.
+  const followed = []
+  let createdCount = 0
+  const oldSession = { id: 'm1', seq: 0, header: { cwd: home }, deriveMessages: () => [], requestHeader: () => ({}) }
+  const freshSession = { id: 'm1-p2', seq: 0, header: { cwd: home }, deriveMessages: () => [], requestHeader: () => ({}) }
+  const oldAgent = { id: 'm1', status: 'idle', whenIdle: async () => {}, runMaintenance: fn => fn(new AbortController().signal), session: oldSession, inbox: { nextStep: [], nextTurn: [], remove: () => {} } }
+  const freshAgent = { id: 'm1-p2', status: 'idle', whenIdle: async () => {}, runMaintenance: fn => fn(new AbortController().signal), session: freshSession, inbox: { nextStep: [], nextTurn: [] }, followup: msg => followed.push(msg) }
+
+  ctx.sessions = { flush: async () => {} }
+  ctx.workspaceRegistry = { archiveSession: async () => {} }
+  rt.eventsBackwards = async function* () {
+    yield { type: 'user/message', seq: 2, time: Date.now(), data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Let us inspect Server A and nginx next.' }] } }
+  }
+  rt.resolveAgent = async id => (id === 'm1-p2' ? freshAgent : oldAgent)
+  rt.createSession = async () => { createdCount += 1; return `m1-p${createdCount + 1}` }
+  rt.ensureCapabilities = async () => {}
+  rt.moveSchedules = async () => {}
+  rt.applyModel = async () => {}
+  rt.applyPermission = async () => {}
+  rt.desiredModel = async () => undefined
+  rt.desiredEffort = async () => undefined
+
+  await rt.newPart('m1')
+  const deadline = Date.now() + 2000
+  while (followed.length === 0 && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 15))
+  }
+  assert.equal(followed.length, 1)
+  const handoffText = followed[0].content[0].text
+  assert.match(handoffText, /## Recalled memory context \(reference only, from recent messages\)/)
+  assert.match(handoffText, /Host: 10\.0\.0\.8/)
+  assert.match(handoffText, /Run nginx -t before reload/)
+
+  // Contrast: lightweight dayRollover must still skip handoffMemoryWarmup.
+  const followedRollover = []
+  const p3Session = { id: 'm1-p3', seq: 0, header: { cwd: home }, deriveMessages: () => [], requestHeader: () => ({}) }
+  const p3Agent = { id: 'm1-p3', status: 'idle', whenIdle: async () => {}, runMaintenance: fn => fn(new AbortController().signal), session: p3Session, inbox: { nextStep: [], nextTurn: [] }, followup: msg => followedRollover.push(msg) }
+  rt.resolveAgent = async id => (id === 'm1-p3' ? p3Agent : freshAgent)
+  await rt.rolloverPart('m1-p2', { date: '2026-11-26' })
+  while (followedRollover.length === 0 && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 15))
+  }
+  assert.equal(followedRollover.length, 1)
+  assert.doesNotMatch(followedRollover[0].content[0].text, /Recalled memory context/)
+})
+
+test('tools/result on memory_forget purges matching orphan artifacts while keeping ticket references and private isolation', (t) => {
+  const { ctx, rt } = startTeam(t)
+  const forgetListener = (ctx.listeners.get('tools/result') ?? []).find(fn => fn.name === 'onMemoryForgetResult')
+  assert.ok(forgetListener, 'onMemoryForgetResult listener registered')
+
+  const baseMs = Date.UTC(2026, 10, 26, 10, 0, 0)
+  const orphanSecret = rt.artifacts.save('forgotten api secret token dump', { sessionId: 'm1', botId: 'm1', now: baseMs })
+  const ticketRef = rt.artifacts.save('retained ticket token output', { sessionId: 'm1', botId: 'm1', now: baseMs })
+  const privateArt = rt.artifacts.save('private bot token note', { sessionId: 'm1', botId: 'p1', isPrivate: true, now: baseMs })
+  const otherSessionArt = rt.artifacts.save('other session token output', { sessionId: 'b2', botId: 'b2', now: baseMs })
+
+  const store = rt.openTicketStore()
+  store.create({ title: 'Keep Ref', goal: 'Hold artifact', ownerBotId: 'm1', createdByBotId: 'm1', artifacts: [ticketRef.handle] })
+
+  // Anchor-only, refused, or error calls do not purge artifacts.
+  forgetListener(
+    { name: 'memory_forget', arguments: { anchor: 'chat://m1/1' }, agent: { id: 'm1' } },
+    { isError: false, content: [{ type: 'text', text: 'Forgot 1 archived message(s).' }] },
+  )
+  forgetListener(
+    { name: 'memory_forget', arguments: { sessionId: 'm1', keyword: 'token' }, agent: { id: 'm1' } },
+    { isError: true, content: [{ type: 'text', text: 'Error' }] },
+  )
+  forgetListener(
+    { name: 'memory_forget', arguments: { sessionId: 'm1', keyword: 'token' }, agent: { id: 'm1' } },
+    { isError: false, content: [{ type: 'text', text: 'Refusing empty forget request' }] },
+  )
+  assert.equal(rt.artifacts.readRaw(orphanSecret.id), 'forgotten api secret token dump')
+
+  // Valid memory_forget call purges matching unreferenced orphan only.
+  forgetListener(
+    { name: 'memory_forget', arguments: { sessionId: 'm1', keyword: 'token' }, agent: { id: 'm1' } },
+    { isError: false, content: [{ type: 'text', text: 'Forgot 2 archived message(s).' }] },
+  )
+  assert.equal(rt.artifacts.readRaw(orphanSecret.id), undefined)
+  assert.equal(rt.artifacts.readRaw(ticketRef.id), 'retained ticket token output')
+  assert.equal(rt.artifacts.readRaw(privateArt.id), 'private bot token note')
+  assert.equal(rt.artifacts.readRaw(otherSessionArt.id), 'other session token output')
+})

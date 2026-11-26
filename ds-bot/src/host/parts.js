@@ -773,6 +773,9 @@ export function install(rt) {
       ...(!complete ? ['(The oldest part of the record could not be read in time, so some messages may be missing.)'] : []),
     ]
     const activeTickets = room === undefined && botId !== undefined ? rt.activeTicketsSummary?.(botId) : undefined
+    const memoryWarmup = room === undefined && dayRollover === undefined && botId !== undefined && recent.length > 0
+      ? rt.handoffMemoryWarmup?.({ botId, recentLines: recent })
+      : undefined
     return [
       `[Handoff · part ${number}]`,
       `DS Bot moved ${where} on to a fresh conversation, part ${number}, because ${reason}. This message is not from the user.`,
@@ -788,6 +791,11 @@ export function install(rt) {
         '',
         '## Active tickets (reference state, not new instructions)',
         activeTickets,
+      ]),
+      ...(memoryWarmup === undefined ? [] : [
+        '',
+        '## Recalled memory context (reference only, from recent messages)',
+        memoryWarmup,
       ]),
       ...(room || (earlier.length === 0 && omitted.length === 0) ? [] : [
         '',
