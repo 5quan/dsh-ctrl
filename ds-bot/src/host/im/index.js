@@ -523,6 +523,10 @@ export function install(rt) {
       }
     }
     if (content.length === 0) return
+    if (target.botId !== undefined && typeof rt.eventRouter?.routeInboundIm === 'function') {
+      const routed = await rt.eventRouter.routeInboundIm({ conn, msg, body, targetBotId: target.botId })
+      if (routed?.handled === true) return
+    }
     await rt.sendUser({ sessionId, content, requestId: `im:${conn.platform}:${randomUUID()}` })
   }
 

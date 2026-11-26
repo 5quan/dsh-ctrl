@@ -819,6 +819,7 @@ export function install(rt) {
   const mailApi = installMail(rt, { entries: () => entries().find(e => e.id === 'mail'), offFor, secrets: { writeSecret, value: name => rt.secretValue(name) }, reason })
   const mailHasAccounts = () => mailApi.hasAccounts()
   rt.mailView = mailApi.mailView
+  rt.mailConnector = { hasAccounts: mailApi.hasAccounts, accounts: mailApi.accounts, connect: mailApi.connect }
 
   const connectorEndpoint = async (endpoint, body) => {
     await rt.loadSecrets()

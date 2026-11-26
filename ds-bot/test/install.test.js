@@ -79,6 +79,7 @@ test('apply registers listeners and effects in a fixed order', (t) => {
     'on session/event',
     'on tools/pre-execute',
     'effect ds-bot: deadline watcher',
+    'effect ds-bot: event router',
     'on approval/request (prepend)',
     'on agent/inbox/discarded',
     'on session/event',
