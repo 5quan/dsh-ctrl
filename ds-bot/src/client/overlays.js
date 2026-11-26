@@ -9,6 +9,8 @@ import { ContextMenu } from './context-menu.js'
 import { PANEL_LINGER_MS, BotPanel } from './browser-pane.js'
 import { frameLayout, FALLBACK_SIDEBAR_WIDTH } from './frame-layout.js'
 import { MemoryDialog } from './memory-panel.js'
+import { CtrlMemoryDialog } from './ctrl/memory-panel.js'
+import { CtrlInboxDialog } from './ctrl/inbox-panel.js'
 import { useLinger } from './motion.js'
 
 // How long a closing dialog or menu stays for its exit (see their [data-leaving] CSS).
@@ -59,6 +61,7 @@ export function Overlays({ useRoster, useUi, useSessions, useSessionStatus, useA
   }
   const [memory, memoryLeaving] = useLinger(ui.memory && memoryOwner(ui.memory) ? ui.memory : null, DIALOG_EXIT_MS)
   const owner = memory ? memoryOwner(memory) : null
+  const [inboxOpen, inboxLeaving] = useLinger(ui.ctrlInbox ? 'open' : null, DIALOG_EXIT_MS)
   const [menu, menuLeaving] = useLinger(ui.menu, MENU_EXIT_MS)
   return h(Fragment, null,
     pane ? createPortal(h(BotPanel, { pane, leaving: shown === null, room: layout.room, overlay: layout.panel === 'overlay', roster, actions, useSessions, useSessionStatus, useActivity, useWork, useBrowserTabs, useBrowserPages, useBrowserHolds }), document.body) : null,
@@ -68,5 +71,8 @@ export function Overlays({ useRoster, useUi, useSessions, useSessionStatus, useA
     ui.voice ? createPortal(h(VoiceMode, { key: ui.voice, sessionId: ui.voice, paneLeft: layout.column, roster, actions, useSessions, useSessionStatus }), document.body) : null,
     menu ? createPortal(h(ContextMenu, { key: `${menu.kind ?? ''}:${menu.id}:${menu.x}:${menu.y}`, menu, roster, actions, useWork, leaving: menuLeaving }), document.body) : null,
     settings ? createPortal(h(SettingsDialog, { page: settings.page, id: settings.id, roster, actions, useUpdate, leaving: settingsLeaving }), document.body) : null,
-    owner ? createPortal(h(MemoryDialog, { key: owner.id, owner, actions, leaving: memoryLeaving }), document.body) : null)
+    owner ? createPortal(roster.dshMemory === true
+      ? h(CtrlMemoryDialog, { key: owner.id, owner, initialTab: ui.memoryTab ?? null, actions, leaving: memoryLeaving })
+      : h(MemoryDialog, { key: owner.id, owner, actions, leaving: memoryLeaving }), document.body) : null,
+    inboxOpen ? createPortal(h(CtrlInboxDialog, { roster, actions, leaving: inboxLeaving }), document.body) : null)
 }

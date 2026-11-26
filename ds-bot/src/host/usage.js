@@ -11,6 +11,7 @@
 // any Session forked or spawned under them), to a group chat's own Session, or to the
 // rest of DSH ("other").
 import { randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { mkdir, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 
@@ -319,6 +320,27 @@ export function install(rt) {
     for (const agent of Object.values(state.agents ?? {})) {
       for (const sessionId of agent.sessions ?? []) owners.set(sessionId, { owner: `agent:${agent.id}`, name: agent.name })
     }
+    const ticketMap = rt.ticketUsageMap?.()
+    const ticketOwners = ticketMap?.bySession
+    if (ticketOwners) {
+      for (const [sessionId, ticketOwner] of ticketOwners) {
+        owners.set(sessionId, { owner: ticketOwner.owner, name: ticketOwner.name })
+      }
+    }
+    const workerOwnerOf = (sessionId) => {
+      const mapped = ticketOwners?.get(sessionId)
+      if (mapped) return { owner: mapped.owner, name: mapped.name }
+      const wCtx = rt.workerContextOf?.(sessionId) ?? rt.workerExecutor?.workerContextOf?.(sessionId)
+      if (!wCtx?.ticketId) return undefined
+      const ticket = ticketMap?.tickets?.get(wCtx.ticketId) ?? (rt.hasTicketStore?.() ? rt.openTicketStore().get(wCtx.ticketId) : undefined)
+      return { owner: `ticket:${wCtx.ticketId}`, name: ticket?.title || wCtx.ticketId }
+    }
+    for (const item of listed ?? []) {
+      if (item?.sessionId && !owners.has(item.sessionId)) {
+        const found = workerOwnerOf(item.sessionId)
+        if (found) owners.set(item.sessionId, found)
+      }
+    }
     const parents = new Map((listed ?? []).filter(item => item.parentSessionId).map(item => [item.sessionId, item.parentSessionId]))
     for (const sessionId of parents.keys()) {
       let root = sessionId
@@ -443,8 +465,15 @@ export function install(rt) {
       // An ended part is complete, so it seals for good.
       const sealOf = sessionId => (ended.has(sessionId) ? { listed: null } : coldWatermarks.has(sessionId) ? { listed: coldWatermarks.get(sessionId) } : undefined)
       const targets = new Map()
-      for (const item of listed) if (item.blank !== true) targets.set(item.sessionId, listedCursor(item))
-      for (const sessionId of owners.keys()) if (!targets.has(sessionId)) targets.set(sessionId, undefined)
+      for (const item of listed) {
+        if (item.blank !== true && storedKinds.get(item.sessionId) !== 'worker') {
+          targets.set(item.sessionId, listedCursor(item))
+        }
+      }
+      for (const sessionId of owners.keys()) {
+        if (storedKinds.get(sessionId) === 'worker') continue
+        if (!targets.has(sessionId)) targets.set(sessionId, undefined)
+      }
       const addresses = new Map(listed.map(item => [item.sessionId, addressOf(item)]))
       let cut = 0
       const failed = []
@@ -508,6 +537,11 @@ export function install(rt) {
         const agent = rt.own(state.agents, id)
         return { key, kind: 'agent', id, name: agent?.name ?? name, ...(agent ? {} : { deleted: true }) }
       }
+      if (key.startsWith('ticket:')) {
+        const id = key.slice('ticket:'.length)
+        const ticket = rt.hasTicketStore?.() ? rt.openTicketStore().get(id) : undefined
+        return { key, kind: 'ticket', id, name: ticket?.title || name || id, status: ticket?.status, ...(ticket ? {} : { deleted: true }) }
+      }
       const bot = rt.botOf(key)
       return { key, kind: 'bot', id: key, name: bot?.name ?? name, ...(bot ? {} : { deleted: true }) }
     }
@@ -547,8 +581,12 @@ export function install(rt) {
     const buckets = new Map()
     const storedKinds = ledger.kinds()
     for (const group of ledger.groups()) {
-      const kind = group.kind === 'turn' ? (groupSessions.has(group.session) || storedKinds.get(group.session) === 'group' ? 'group' : 'chat') : group.kind
-      const row = [hourOf(group.slot * SLOT_MS), ownerOf(group.session), modelOf(group.provider, group.model), kindOf(kind)]
+      const ownerIdx = ownerOf(group.session)
+      const isWorker = owners[ownerIdx]?.kind === 'ticket' || storedKinds.get(group.session) === 'worker'
+      const kind = group.kind === 'turn'
+        ? (isWorker ? 'worker' : groupSessions.has(group.session) || storedKinds.get(group.session) === 'group' ? 'group' : 'chat')
+        : group.kind
+      const row = [hourOf(group.slot * SLOT_MS), ownerIdx, modelOf(group.provider, group.model), kindOf(kind)]
       const id = row.join('\n')
       const bucket = buckets.get(id) ?? [...row, 0, 0, 0, 0, 0]
       bucket[4] += group.input
@@ -566,7 +604,169 @@ export function install(rt) {
       rows: [...buckets.values()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)),
       now: hourOf(Date.now()),
       scanning: scanning !== undefined,
+      ticketUsage: await usageTicketSummary({ ledger, stored, live }),
     }
+  }
+
+  async function usageTicketSummary({ ticketId, ledger: givenLedger, stored: givenStored, live: givenLive } = {}) {
+    const cleanTicketId = typeof ticketId === 'string' && ticketId.trim() !== '' ? ticketId.trim() : undefined
+    const ticketMap = rt.ticketUsageMap?.() ?? { bySession: new Map(), tickets: new Map(), assignments: [] }
+    const hasLedgerFile = ledger !== undefined || existsSync(path)
+    const emptyTotals = { total: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0, calls: 0, steps: 0, ticketCount: 0, assignmentCount: 0 }
+    if (!hasLedgerFile && ticketMap.tickets.size === 0) {
+      return { tickets: [], totals: emptyTotals }
+    }
+
+    const book = givenLedger ?? (hasLedgerFile ? await openLedger() : undefined)
+    const bookStored = givenStored ?? book?.owners?.() ?? new Map()
+    const bookLive = givenLive ?? liveOwners(listed, bookStored)
+
+    const sessionSums = new Map()
+    const sessionTicketIds = new Map()
+    const ticketIds = new Set(ticketMap.tickets.keys())
+
+    for (const group of book?.groups?.() ?? []) {
+      const mappedTicketId = ticketMap.bySession.get(group.session)?.ticketId
+      const ownerEntry = bookLive.get(group.session) ?? bookStored.get(group.session)
+      const ownerTicketId = ownerEntry?.owner?.startsWith('ticket:') ? ownerEntry.owner.slice('ticket:'.length) : undefined
+      const resolvedTicketId = mappedTicketId ?? ownerTicketId
+      if (!resolvedTicketId) continue
+      if (cleanTicketId !== undefined && resolvedTicketId !== cleanTicketId) continue
+
+      ticketIds.add(resolvedTicketId)
+      if (!sessionTicketIds.has(group.session)) sessionTicketIds.set(group.session, new Set())
+      sessionTicketIds.get(group.session).add(resolvedTicketId)
+
+      const cur = sessionSums.get(group.session) ?? { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, calls: 0, total: 0 }
+      cur.input += group.input
+      cur.cacheRead += group.cacheRead
+      cur.cacheWrite += group.cacheWrite
+      cur.output += group.output
+      cur.calls += group.calls
+      cur.total = cur.input + cur.cacheRead + cur.cacheWrite + cur.output
+      sessionSums.set(group.session, cur)
+    }
+
+    const assignmentsByTicket = new Map()
+    for (const assignment of ticketMap.assignments) {
+      if (cleanTicketId !== undefined && assignment.ticketId !== cleanTicketId) continue
+      if (!assignmentsByTicket.has(assignment.ticketId)) assignmentsByTicket.set(assignment.ticketId, [])
+      assignmentsByTicket.get(assignment.ticketId).push(assignment)
+      ticketIds.add(assignment.ticketId)
+    }
+
+    const ticketsOut = []
+    const totals = { ...emptyTotals }
+    const targetIds = cleanTicketId !== undefined ? (ticketIds.has(cleanTicketId) ? [cleanTicketId] : []) : [...ticketIds]
+
+    for (const id of targetIds) {
+      const ticket = ticketMap.tickets.get(id)
+      const list = assignmentsByTicket.get(id) ?? []
+      const seenSessions = new Set()
+      let input = 0
+      let cacheRead = 0
+      let cacheWrite = 0
+      let output = 0
+      let calls = 0
+      let steps = 0
+      let total = 0
+      const assignmentRows = []
+
+      for (const assignment of list) {
+        const sId = assignment.workerSessionId
+        if (sId) seenSessions.add(sId)
+        const sSum = sId ? sessionSums.get(sId) : undefined
+        const ledgerTotal = sSum?.total ?? 0
+        const fallbackTotal = ledgerTotal === 0 && assignment.tokenUsage > 0 ? assignment.tokenUsage : 0
+        const aTotal = ledgerTotal > 0 ? ledgerTotal : fallbackTotal
+        input += sSum?.input ?? 0
+        cacheRead += sSum?.cacheRead ?? 0
+        cacheWrite += sSum?.cacheWrite ?? 0
+        output += sSum?.output ?? 0
+        calls += sSum?.calls ?? 0
+        steps += assignment.stepCount ?? 0
+        total += aTotal
+        assignmentRows.push({
+          id: assignment.id,
+          workerSessionId: sId,
+          status: assignment.status,
+          reportStatus: assignment.reportStatus,
+          stepCount: assignment.stepCount ?? 0,
+          calls: sSum?.calls ?? 0,
+          input: sSum?.input ?? 0,
+          cacheRead: sSum?.cacheRead ?? 0,
+          cacheWrite: sSum?.cacheWrite ?? 0,
+          output: sSum?.output ?? 0,
+          total: aTotal,
+          estimated: fallbackTotal > 0,
+          createdAt: assignment.createdAt,
+          endedAt: assignment.endedAt,
+        })
+      }
+
+      for (const [sId, tSet] of sessionTicketIds) {
+        if (!tSet.has(id) || seenSessions.has(sId)) continue
+        const sSum = sessionSums.get(sId)
+        if (!sSum) continue
+        input += sSum.input
+        cacheRead += sSum.cacheRead
+        cacheWrite += sSum.cacheWrite
+        output += sSum.output
+        calls += sSum.calls
+        total += sSum.total
+        assignmentRows.push({
+          id: sId,
+          workerSessionId: sId,
+          status: 'ended',
+          reportStatus: '',
+          stepCount: 0,
+          calls: sSum.calls,
+          input: sSum.input,
+          cacheRead: sSum.cacheRead,
+          cacheWrite: sSum.cacheWrite,
+          output: sSum.output,
+          total: sSum.total,
+          estimated: false,
+          createdAt: 0,
+          endedAt: null,
+        })
+      }
+
+      if (total === 0 && assignmentRows.length === 0) continue
+
+      const ownerName = ticket?.ownerBotId ? (rt.botOf?.(ticket.ownerBotId)?.name ?? ticket.ownerBotId) : ''
+      const storedOwnerName = [...seenSessions].map(sId => (bookLive.get(sId) ?? bookStored.get(sId))?.name).find(Boolean)
+      ticketsOut.push({
+        id,
+        title: ticket?.title || storedOwnerName || id,
+        status: ticket?.status ?? 'deleted',
+        ownerBotId: ticket?.ownerBotId ?? '',
+        ownerBotName: ownerName,
+        assignmentCount: assignmentRows.length,
+        steps,
+        calls,
+        input,
+        cacheRead,
+        cacheWrite,
+        output,
+        total,
+        updatedAt: ticket?.updatedAt ?? 0,
+        assignments: assignmentRows,
+      })
+
+      totals.input += input
+      totals.cacheRead += cacheRead
+      totals.cacheWrite += cacheWrite
+      totals.output += output
+      totals.calls += calls
+      totals.steps += steps
+      totals.total += total
+      totals.assignmentCount += assignmentRows.length
+    }
+
+    ticketsOut.sort((a, b) => b.total - a.total || b.updatedAt - a.updatedAt)
+    totals.ticketCount = ticketsOut.length
+    return { tickets: ticketsOut, totals }
   }
 
   // DS Bot tags the requests it makes outside a Session with the Session they serve.
@@ -585,7 +785,7 @@ export function install(rt) {
   // Owner and group use are journaled with the call itself: a Bot or room that
   // is deleted before the first scan still leaves its calls under its own name.
   const journaled = new Map()
-  const journal = (book, sessionId) => {
+  const journal = (book, sessionId, isWorker = false) => {
     if (typeof sessionId !== 'string' || sessionId === '') return
     const owner = liveOwners(listed, book.owners()).get(sessionId)
     if (owner !== undefined && owner.name !== '') {
@@ -595,7 +795,10 @@ export function install(rt) {
         book.setOwner(sessionId, owner)
       }
     }
-    if (inGroup().has(sessionId) && journaled.get(`${sessionId}\ngroup`) === undefined) {
+    if (isWorker && journaled.get(`${sessionId}\nworker`) === undefined) {
+      journaled.set(`${sessionId}\nworker`, true)
+      book.setKind(sessionId, 'worker')
+    } else if (inGroup().has(sessionId) && journaled.get(`${sessionId}\ngroup`) === undefined) {
       journaled.set(`${sessionId}\ngroup`, true)
       book.setKind(sessionId, 'group')
     }
@@ -603,20 +806,23 @@ export function install(rt) {
   // Plain Session requests skip the meter, so every caller notes its Session
   // here. The journal needs the team state and the ledger; both load behind
   // the request, and `journaled` keeps the repeat calls from writing again.
-  const noteSession = (sessionId) => {
+  const noteSession = (sessionId, isWorker = false) => {
     if (typeof sessionId !== 'string' || sessionId === '') return
     void (async () => {
       await rt.load()
       const book = ledger ?? await openLedger().catch(() => undefined)
       if (book === undefined) return
-      try { journal(book, sessionId) } catch (error) { rt.warn('ds-bot: usage could not journal %s: %s', sessionId, error) }
+      try { journal(book, sessionId, isWorker) } catch (error) { rt.warn('ds-bot: usage could not journal %s: %s', sessionId, error) }
     })()
   }
-  function record({ sessionId, kind, provider, model, usage }) {
-    noteSession(sessionId)
+  function record({ sessionId, kind, provider, model, usage, isWorker = false }) {
+    noteSession(sessionId, isWorker)
     const row = { key: `live:${randomUUID()}`, session: sessionId ?? '', time: Date.now(), provider: provider ?? '', model: model ?? '', kind, ...tokensOf(usage) }
     if (ledger !== undefined) {
-      try { ledger.add(row) } catch (error) { rt.warn('ds-bot: usage could not record a call: %s', error) }
+      try {
+        ledger.add(row)
+        if (isWorker && typeof sessionId === 'string' && sessionId !== '') ledger.setKind(sessionId, 'worker')
+      } catch (error) { rt.warn('ds-bot: usage could not record a call: %s', error) }
       return
     }
     early.push(row)
@@ -626,10 +832,11 @@ export function install(rt) {
   // A request listener that rewrites a request starts it over, so the same usage chunk
   // can pass here twice; it counts once.
   const counted = new WeakSet()
-  // A Session's own requests are in its log; every other request is metered here.
+  // A Session's own requests are in its log; hidden Worker and side-channel requests are metered here.
   ctx.on('llm/stream', (options, next) => {
     const tag = tags.get(options.messages)
-    if (tag === undefined && options.sessionId !== undefined && options.purpose === undefined) {
+    const isWorker = tag === undefined && options.purpose === undefined && rt.workerExecutor?.isWorkerSession?.(options.sessionId) === true
+    if (tag === undefined && options.sessionId !== undefined && options.purpose === undefined && !isWorker) {
       noteSession(options.sessionId)
       return next()
     }
@@ -644,10 +851,19 @@ export function install(rt) {
           yield chunk
         }
       } finally {
-        if (usage !== undefined) record({ sessionId: tag?.sessionId ?? options.sessionId, kind: tag?.kind ?? options.purpose ?? 'other', provider: options.provider, model: options.model, usage })
+        if (usage !== undefined) {
+          record({
+            sessionId: tag?.sessionId ?? options.sessionId,
+            kind: tag?.kind ?? options.purpose ?? (isWorker ? 'worker' : 'other'),
+            provider: options.provider,
+            model: options.model,
+            usage,
+            isWorker,
+          })
+        }
       }
     })()
   })
 
-  Object.assign(rt, { usageView, tagUsage, carryUsageTag, ownRequest })
+  Object.assign(rt, { usageView, usageTicketSummary, tagUsage, carryUsageTag, ownRequest })
 }

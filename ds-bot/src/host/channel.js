@@ -120,6 +120,8 @@ export function install(rt) {
     browser: rt.browserEnabled,
     // False when config.memory turns memory off: no Memory row or panel.
     memory: rt.memoryEnabled !== false,
+    // True when peer plugin dsh-memory exposes its public Cordis service.
+    dshMemory: rt.memoryBridge?.isAvailable?.() === true,
     // Set while another dsh host holds the team (store.js): why this one cannot change it.
     readOnly: rt.readOnly() ?? null,
     // IM connections (settings → IM): one per chat-app bot the user added.
@@ -137,6 +139,7 @@ export function install(rt) {
   const live = () => ({
     activity: rt.activityView(),
     work: { bots: rt.workView(), rooms: rt.roomWorkView(), approvals: rt.approvalsView(), waiting: rt.waitingView?.() ?? {}, turns: rt.turnsView?.() ?? {}, steered: rt.steeredView?.() ?? {} },
+    ctrlInbox: rt.ctrlInboxSummary?.() ?? { total: 0, counts: { approvals: 0, tickets: 0, memory: 0 } },
     memoryNews: rt.memoryNews(),
     memoryReviews: rt.memoryReviews(),
     learning: rt.learningView(),
@@ -167,7 +170,7 @@ export function install(rt) {
   }
   // What a host that only reads the team may still answer.
   // Updates change the dsh profile, not the team, so a reading host may run them too.
-  const READS = new Set(['state', 'models', 'efforts', 'providers', 'provider-models', 'earlier', 'chat', 'run-stats', 'room-progress', 'group-rows', 'exchange', 'exchange-text', 'file-text', 'usage', 'schedules', 'memory-view', 'browser-wait', 'browser-result', 'diagnostics', 'diagnostics-log', 'diagnostics-clear', 'update-check', 'update-install', 'dsh-update-install', 'repo-stars', 'approval-answer', 'thinking', 'avatar-library', 'computer-system-status', 'computer-shot', 'local-agents', 'local-agent-models', 'browser-frame', 'hello', 'notices', 'avatar', 'room-chat', 'usage-summary', 'image'])
+  const READS = new Set(['state', 'models', 'efforts', 'providers', 'provider-models', 'earlier', 'chat', 'run-stats', 'room-progress', 'group-rows', 'exchange', 'exchange-text', 'file-text', 'usage', 'schedules', 'memory-view', 'browser-wait', 'browser-result', 'diagnostics', 'diagnostics-log', 'diagnostics-clear', 'update-check', 'update-install', 'dsh-update-install', 'repo-stars', 'approval-answer', 'thinking', 'avatar-library', 'computer-system-status', 'computer-shot', 'local-agents', 'local-agent-models', 'browser-frame', 'hello', 'notices', 'avatar', 'room-chat', 'usage-summary', 'image', 'ctrl-memory-overview', 'ctrl-memory-read', 'ctrl-inbox', 'ctrl-ticket-usage'])
 
   async function setPrefs(body) {
     if (body.theme !== undefined) {
@@ -783,6 +786,10 @@ export function install(rt) {
           if (endpoint.startsWith('computer-')) {
             await rt.load()
             return ok(await rt.computerEndpoint(endpoint.slice('computer-'.length), body))
+          }
+          if (endpoint.startsWith('ctrl-') && typeof rt.ctrlEndpoint === 'function') {
+            await rt.load()
+            return ok(await rt.ctrlEndpoint(endpoint.slice('ctrl-'.length), body))
           }
           return fail(`Unknown endpoint ${endpoint}`, 'bot/not-found')
       }
