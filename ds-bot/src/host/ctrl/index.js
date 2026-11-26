@@ -8,8 +8,9 @@ import * as dayRollover from './day-rollover.js'
 import * as briefing from './briefing.js'
 import * as workerExecutor from './worker-executor.js'
 import * as mandateGuard from './mandate-guard.js'
+import * as deadlineWatcher from './deadline-watcher.js'
 
-const CTRL_MODULES = [tickets, ticketQueue, artifacts, memoryBridge, dayRollover, briefing, workerExecutor, mandateGuard]
+const CTRL_MODULES = [tickets, ticketQueue, artifacts, memoryBridge, dayRollover, briefing, workerExecutor, mandateGuard, deadlineWatcher]
 
 export function install(rt) {
   for (const module of CTRL_MODULES) module.install(rt)

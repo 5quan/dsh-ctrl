@@ -77,6 +77,7 @@ test('apply registers listeners and effects in a fixed order', (t) => {
     'prompt ctrl-worker 642',
     'on session/event',
     'on tools/pre-execute',
+    'effect ds-bot: deadline watcher',
     'on approval/request (prepend)',
     'on agent/inbox/discarded',
     'on session/event',
