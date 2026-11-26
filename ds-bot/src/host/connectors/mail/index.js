@@ -585,6 +585,7 @@ export function install(rt, host) {
 
   return {
     hasAccounts,
+    accounts: accountList,
     mailView,
     connect,
     async endpoint(name, body) {
