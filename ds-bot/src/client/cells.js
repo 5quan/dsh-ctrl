@@ -2,7 +2,8 @@ import { createElement as h, Fragment, useEffect, useLayoutEffect, useMemo, useR
 import { createPortal } from 'react-dom'
 import { MarkdownText, writeClipboard } from './dsh-primitives.js'
 import { inkText } from './inks.js'
-import { linkMentions, mentionTarget, dayLabel, contentText, stripHeader, isHiddenTurn, isRelayContext, relaysBefore, relayPart, commRunOf, toolName, toolArgs, reminderPrompts, elapsedLabel, clockLabel, messageClock } from './text.js'
+import { linkMentions, mentionTarget, contentText, stripHeader, isHiddenTurn, isRelayContext, relaysBefore, relayPart, commRunOf, toolName, toolArgs, reminderPrompts, elapsedLabel, clockLabel, messageClock } from './text.js'
+import { formatTimelineDate, normalizeTimelineItems, shouldShowPartBoundary } from './ctrl/timeline.js'
 import { SmileIcon, ReplyIcon, DotsIcon, CheckIcon, DownloadIcon, CopyIcon, GoalIcon, MemoryIcon } from './icons.js'
 import { goalEventText } from './goal.js'
 import { colorOf, toolState, BotMark, RoomAvatar } from './mark.js'
@@ -469,7 +470,8 @@ function MemoryEvent({ sessionId, scope, tool, result, failed, code, roster, act
 }
 
 function PartLine({ time }) {
-  return h('div', { className: 'bt-part-line', role: 'separator' }, Number.isFinite(time) ? h('span', null, dayLabel(time)) : null)
+  const label = Number.isFinite(time) ? formatTimelineDate(time) : ''
+  return h('div', { className: 'bt-part-line', role: 'separator' }, label ? h('span', null, label) : null)
 }
 
 const scrollParent = (node) => {
@@ -559,15 +561,16 @@ function EarlierParts({ sessionId, roster, actions }) {
     ...current,
     pages: current.pages.map(page => ({ ...page, btw: page.btw.filter(card => card?.id !== cardId) })),
   }))
-  const items = []
-  for (const page of view.pages) items.push(...withBtwRows(page.items, page.btw))
+  const rawItems = []
+  for (const page of view.pages) rawItems.push(...withBtwRows(page.items, page.btw))
+  const items = normalizeTimelineItems(rawItems)
   return h('div', { className: 'bt-earlier', role: 'feed', 'aria-label': t('Earlier messages'), 'aria-busy': view.loading },
     h('div', { ref: top, className: 'bt-earlier-top' },
       view.loading ? h(Shimmer, null, t('Loading earlier messages…'))
         : view.failed ? h('button', { type: 'button', className: 'bt-soft', onClick: () => load(view.cursor) }, t('Couldn’t load earlier messages · Retry'))
           : view.cursor ? h('button', { type: 'button', className: 'bt-soft', onClick: () => load(view.cursor) }, t('Load earlier')) : null),
     h(ChatRows, { items, sessionId, roster, actions, onBtwDelete: removeBtw }),
-    h(PartLine, { time: view.startedAt }))
+    shouldShowPartBoundary(items, view.startedAt) ? h(PartLine, { time: view.startedAt }) : null)
 }
 
 // A Bot chat's entries as the host lists them (the `earlier` and `chat` endpoints): the

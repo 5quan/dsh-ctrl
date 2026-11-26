@@ -6,6 +6,7 @@ import { CalendarIcon, ChatsIcon, ChevronLeftIcon, ChevronRightIcon } from './ic
 import { reducedMotion, useGlide } from './motion.js'
 import { dateLocale, t } from './i18n.js'
 import { DAY_MS, HOUR, HOUR_MS, MODEL, OWNER, RANGES, compact, dayKey, hourMs, mondayOf, percent, spanRange, summarize, tokensOf } from './usage-data.js'
+import { TicketUsageCard, ticketOwnerFace, workerKindLabel } from './ctrl/ticket-usage-card.js'
 
 // Usage page: the host's ledger as hourly rows, summed here by hour, day, week, or
 // month, over a preset range or days picked on a calendar. The overview stacks the
@@ -127,10 +128,13 @@ function ownerFace(owner, roster) {
       paint: 'var(--bt-us-rest)', glyph: size => glyphBox(size, ChatsIcon),
     }
   }
+  if (owner.kind === 'ticket') return ticketOwnerFace(owner)
   return { kind: 'other', name: t('Other'), sub: '', paint: 'var(--bt-us-rest)', glyph: size => glyphBox(size, ChatsIcon) }
 }
 
 function kindLabel(kind, botFocus) {
+  const custom = workerKindLabel(kind)
+  if (custom) return custom
   const labels = { chat: botFocus ? t('Own chat') : t('Conversations'), group: t('Group chats'), compaction: t('Compaction and handoff'), image: t('Image reading'), memory: t('Memory'), 'session-title': t('Titles'), btw: t('Side chat'), side: t('Side chat'), other: t('Other') }
   return labels[kind] ?? kind
 }
@@ -578,7 +582,8 @@ export function UsagePage({ roster, actions, focusId }) {
             bots.length > 0 && rest.length > 0 ? h('div', { className: 'bt-us-split', role: 'separator' }) : null,
             rest.map((entry, index) => ownerRow(entry, bots.length + index))),
           h(ListCard, { title: t('Models'), count: usedModels.length, index: 3 }, usedModels.length > 0 ? usedModels.map(modelRow) : nothing)),
-        h(Heat, { key: 'heat', view, keep, paint: 'var(--bt-accent)', index: 4 })),
+        h(TicketUsageCard, { key: 'ticket-usage', ticketUsage: view.ticketUsage, onPickTicket: id => pick({ kind: 'owner', key: `ticket:${id}` }), index: 4 }),
+        h(Heat, { key: 'heat', view, keep, paint: 'var(--bt-accent)', index: 5 })),
     ]
   }
 

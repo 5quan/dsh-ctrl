@@ -10,8 +10,9 @@ import * as workerExecutor from './worker-executor.js'
 import * as mandateGuard from './mandate-guard.js'
 import * as deadlineWatcher from './deadline-watcher.js'
 import * as eventRouter from './event-router.js'
+import * as panelApi from './panel-api.js'
 
-const CTRL_MODULES = [tickets, ticketQueue, artifacts, memoryBridge, dayRollover, briefing, workerExecutor, mandateGuard, deadlineWatcher, eventRouter]
+const CTRL_MODULES = [tickets, ticketQueue, artifacts, memoryBridge, dayRollover, briefing, workerExecutor, mandateGuard, deadlineWatcher, eventRouter, panelApi]
 
 export function install(rt) {
   for (const module of CTRL_MODULES) module.install(rt)

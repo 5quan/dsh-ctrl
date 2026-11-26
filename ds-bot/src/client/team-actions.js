@@ -57,8 +57,16 @@ export function teamActions({ call, after, partFor, roster, ui, live, cards, hel
     // DS Bot's own Models page: the providers DSH serves, their keys and models.
     openModels: () => openSettings('models'),
     closeSettings: () => { ui.set(state => (state.settings ? { ...state, settings: null } : state)) },
-    openMemory: (id) => { ui.set(state => ({ ...state, memory: id, menu: null, palette: null })) },
-    closeMemory: () => { ui.set(state => (state.memory ? { ...state, memory: null } : state)) },
+    openMemory: (id, tab = null) => { ui.set(state => ({ ...state, memory: id, memoryTab: tab ?? null, menu: null, palette: null })) },
+    closeMemory: () => { ui.set(state => (state.memory ? { ...state, memory: null, memoryTab: null } : state)) },
+    openCtrlInbox: () => { ui.set(state => ({ ...state, ctrlInbox: true, menu: null, palette: null })) },
+    closeCtrlInbox: () => { ui.set(state => (state.ctrlInbox ? { ...state, ctrlInbox: false } : state)) },
+    ctrlMemoryOverview: () => call('ctrl-memory-overview'),
+    ctrlMemoryRead: (kind, key = '') => call('ctrl-memory-read', { kind, key }),
+    ctrlMemorySave: (kind, key, content) => after(call('ctrl-memory-save', { kind, key, content })),
+    ctrlMemoryConfirm: payload => after(call('ctrl-memory-confirm', payload)),
+    ctrlInbox: () => call('ctrl-inbox'),
+    ctrlTicketUsage: ticketId => call('ctrl-ticket-usage', { ...(ticketId ? { ticketId } : {}), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone }),
     openConnectors: () => { ui.set(state => ({ ...state, settings: { page: 'connectors', id: null }, menu: null, palette: null, newChat: null })) },
     setPanelView: (view) => {
       if (view !== 'details' && view !== 'browser' && view !== 'side') return
