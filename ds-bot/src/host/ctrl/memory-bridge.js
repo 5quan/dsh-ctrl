@@ -221,6 +221,36 @@ export function install(rt) {
     return { ...res, target: 'note', deduplicated: false }
   }
 
+  function buildHandoffMemoryWarmup({ botId, recentLines = [], maxEntityTokens = 800, maxLessonTokens = 600 } = {}) {
+    if (!isAvailable()) return undefined
+    if (botId && rt.botOf?.(botId)?.private === true) return undefined
+
+    const rawList = Array.isArray(recentLines) ? recentLines : [recentLines]
+    const probeText = rawList
+      .map(item => (typeof item === 'string' ? item : ''))
+      .join('\n')
+      .trim()
+    if (probeText === '') return undefined
+
+    const entities = matchEntities(probeText, { maxTokens: maxEntityTokens })
+    const lessons = matchLessons(probeText, { maxTokens: maxLessonTokens })
+    const sections = []
+    if (typeof entities?.text === 'string' && entities.text.trim() !== '') {
+      sections.push(`### Referenced Entities\n${entities.text.trim()}`)
+    }
+    if (typeof lessons?.text === 'string' && lessons.text.trim() !== '') {
+      sections.push(`### Relevant Lessons\n${lessons.text.trim()}`)
+    }
+    return sections.length > 0 ? sections.join('\n\n') : undefined
+  }
+
+  function purgeArtifactsForForget({ sessionId, date, fromMs, toMs, keyword, callerBotId } = {}) {
+    if (typeof rt.artifacts?.pruneForForget !== 'function') {
+      return { scanned: 0, matched: 0, deleted: 0, keptReferenced: 0, keptPrivate: 0, errors: 0 }
+    }
+    return rt.artifacts.pruneForForget({ sessionId, date, fromMs, toMs, keyword, callerBotId })
+  }
+
   function onDayRolledOver(listener) {
     if (typeof listener !== 'function') return () => {}
     rolloverListeners.add(listener)
@@ -237,6 +267,35 @@ export function install(rt) {
     }
   })
 
+  ctx.on('tools/result', function onMemoryForgetResult(exec, result) {
+    if (exec?.name !== 'memory_forget' || result?.isError === true) return
+    const resultTexts = Array.isArray(result?.content)
+      ? result.content.filter(b => b?.type === 'text' && typeof b.text === 'string').map(b => b.text)
+      : []
+    if (resultTexts.some(t => t.startsWith('Refusing empty forget request') || t.startsWith('Memory is disabled'))) {
+      return
+    }
+    const args = exec?.arguments && typeof exec.arguments === 'object' ? exec.arguments : {}
+    const cleanSessionId = typeof args.sessionId === 'string' ? args.sessionId.trim() : ''
+    const cleanDate = typeof args.date === 'string' ? args.date.trim() : ''
+    const cleanKeyword = typeof args.keyword === 'string' ? args.keyword.trim() : ''
+    if (cleanSessionId === '' && cleanDate === '' && cleanKeyword === '') return
+
+    const callerSessionId = exec?.agent?.id ?? exec?.agent?.session?.id
+    const callerBotId = callerSessionId ? rt.selfOf?.(callerSessionId) : undefined
+    try {
+      purgeArtifactsForForget({
+        sessionId: cleanSessionId || undefined,
+        date: cleanDate || undefined,
+        keyword: cleanKeyword || undefined,
+        callerBotId,
+      })
+    } catch (error) {
+      rt.warn?.('ds-bot: purging artifacts after memory_forget failed: %s', error?.message ?? error)
+    }
+  })
+
+  rt.handoffMemoryWarmup = buildHandoffMemoryWarmup
   rt.memoryBridge = {
     getService,
     isAvailable,
@@ -249,6 +308,8 @@ export function install(rt) {
     submitBufferCandidate,
     submitTicketRetrospective,
     recordTicketMilestone,
+    buildHandoffMemoryWarmup,
+    purgeArtifactsForForget,
     onDayRolledOver,
   }
 }

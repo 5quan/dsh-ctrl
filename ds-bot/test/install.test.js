@@ -71,6 +71,7 @@ test('apply registers listeners and effects in a fixed order', (t) => {
     'on tools/post-execute',
     'effect ds-bot: artifact gc',
     'on dsh-memory/day-rolled-over',
+    'on tools/result',
     'on agent/status',
     'on agent/pre-step',
     'effect ds-bot: worker identity section',

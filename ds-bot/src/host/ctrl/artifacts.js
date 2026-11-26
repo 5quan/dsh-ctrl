@@ -245,15 +245,16 @@ export function createArtifactStore({
     }
   }
 
-  function pruneExpired({
-    retentionDays = DEFAULT_ARTIFACT_RETENTION_DAYS,
-    now = Date.now(),
-    referencedHandles = [],
-  } = {}) {
-    if (!existsSync(dir) || typeof retentionDays !== 'number' || !Number.isFinite(retentionDays) || retentionDays <= 0) {
-      return { scanned: 0, deleted: 0, keptReferenced: 0, keptFresh: 0, errors: 0 }
+  function localDateOfMs(ms, timeZone) {
+    try {
+      const tz = timeZone ? { timeZone } : {}
+      return new Intl.DateTimeFormat('en-CA', { ...tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(ms)
+    } catch {
+      return new Date(ms).toISOString().slice(0, 10)
     }
+  }
 
+  function buildReferencedIdSet(referencedHandles) {
     const referencedIds = new Set()
     for (const rawEntry of referencedHandles) {
       if (typeof rawEntry !== 'string') continue
@@ -265,13 +266,55 @@ export function createArtifactStore({
         referencedIds.add(match[1].toLowerCase())
       }
     }
+    return referencedIds
+  }
 
-    const cutoff = now - retentionDays * 86_400_000
+  function resolveArtifactCreatedAt(id, meta) {
+    let createdAt = typeof meta?.createdAt === 'number' && Number.isFinite(meta.createdAt) ? meta.createdAt : null
+    if (createdAt === null) {
+      for (const p of [textPathOf(id), metaPathOf(id)]) {
+        try {
+          const st = statSync(p)
+          createdAt = createdAt === null ? st.mtimeMs : Math.max(createdAt, st.mtimeMs)
+        } catch {}
+      }
+    }
+    return createdAt
+  }
+
+  function unlinkArtifactFiles(id) {
+    let errors = 0
+    for (const p of [textPathOf(id), metaPathOf(id)]) {
+      try {
+        unlinkSync(p)
+      } catch (err) {
+        if (err?.code !== 'ENOENT') errors += 1
+      }
+    }
+    return errors
+  }
+
+  function collectArtifactIds() {
     const ids = new Set()
     for (const fileName of readdirSync(dir)) {
       const m = ARTIFACT_FILENAME_RE.exec(fileName)
       if (m) ids.add(m[1])
     }
+    return ids
+  }
+
+  function pruneExpired({
+    retentionDays = DEFAULT_ARTIFACT_RETENTION_DAYS,
+    now = Date.now(),
+    referencedHandles = [],
+  } = {}) {
+    if (!existsSync(dir) || typeof retentionDays !== 'number' || !Number.isFinite(retentionDays) || retentionDays <= 0) {
+      return { scanned: 0, deleted: 0, keptReferenced: 0, keptFresh: 0, errors: 0 }
+    }
+
+    const referencedIds = buildReferencedIdSet(referencedHandles)
+    const cutoff = now - retentionDays * 86_400_000
+    const ids = collectArtifactIds()
 
     let scanned = 0
     let deleted = 0
@@ -286,38 +329,92 @@ export function createArtifactStore({
         continue
       }
 
-      const textPath = textPathOf(id)
-      const metaPath = metaPathOf(id)
-      const meta = getMeta(id)
-      let createdAt = typeof meta?.createdAt === 'number' && Number.isFinite(meta.createdAt) ? meta.createdAt : null
-      if (createdAt === null) {
-        for (const p of [textPath, metaPath]) {
-          try {
-            const st = statSync(p)
-            createdAt = createdAt === null ? st.mtimeMs : Math.max(createdAt, st.mtimeMs)
-          } catch {}
-        }
-      }
+      const createdAt = resolveArtifactCreatedAt(id, getMeta(id))
       if (createdAt !== null && createdAt >= cutoff) {
         keptFresh += 1
         continue
       }
 
-      let failed = false
-      for (const p of [textPath, metaPath]) {
-        try {
-          unlinkSync(p)
-        } catch (err) {
-          if (err?.code !== 'ENOENT') {
-            failed = true
-            errors += 1
-          }
-        }
-      }
-      if (!failed) deleted += 1
+      const unlinkErrors = unlinkArtifactFiles(id)
+      errors += unlinkErrors
+      if (unlinkErrors === 0) deleted += 1
     }
 
     return { scanned, deleted, keptReferenced, keptFresh, errors }
+  }
+
+  function pruneMatching({
+    sessionId,
+    date,
+    fromMs,
+    toMs,
+    keyword,
+    timeZone,
+    referencedHandles = [],
+    allowPrivateBotId,
+  } = {}) {
+    const cleanSessionId = typeof sessionId === 'string' && sessionId.trim() !== '' ? sessionId.trim() : null
+    const cleanDate = typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date.trim()) ? date.trim() : null
+    const cleanKeyword = typeof keyword === 'string' && keyword.trim() !== '' ? keyword.trim().toLowerCase() : null
+    const cleanFromMs = typeof fromMs === 'number' && Number.isFinite(fromMs) ? fromMs : null
+    const cleanToMs = typeof toMs === 'number' && Number.isFinite(toMs) ? toMs : null
+
+    if (
+      (cleanSessionId === null && cleanDate === null && cleanKeyword === null && cleanFromMs === null && cleanToMs === null)
+      || !existsSync(dir)
+    ) {
+      return { scanned: 0, matched: 0, deleted: 0, keptReferenced: 0, keptPrivate: 0, errors: 0 }
+    }
+
+    const referencedIds = buildReferencedIdSet(referencedHandles)
+    const ids = collectArtifactIds()
+
+    let scanned = 0
+    let matched = 0
+    let deleted = 0
+    let keptReferenced = 0
+    let keptPrivate = 0
+    let errors = 0
+
+    for (const id of ids) {
+      scanned += 1
+      const meta = getMeta(id)
+      if (meta?.private === true && allowPrivateBotId !== undefined && meta.botId !== allowPrivateBotId) {
+        keptPrivate += 1
+        continue
+      }
+      if (cleanSessionId !== null && meta?.sessionId !== cleanSessionId) {
+        continue
+      }
+      const createdAt = resolveArtifactCreatedAt(id, meta)
+      if (cleanDate !== null && (createdAt === null || localDateOfMs(createdAt, timeZone) !== cleanDate)) {
+        continue
+      }
+      if (cleanFromMs !== null && (createdAt === null || createdAt < cleanFromMs)) {
+        continue
+      }
+      if (cleanToMs !== null && (createdAt === null || createdAt > cleanToMs)) {
+        continue
+      }
+      if (cleanKeyword !== null) {
+        const raw = readRaw(id)
+        if (typeof raw !== 'string' || !raw.toLowerCase().includes(cleanKeyword)) {
+          continue
+        }
+      }
+
+      matched += 1
+      if (referencedIds.has(id.toLowerCase())) {
+        keptReferenced += 1
+        continue
+      }
+
+      const unlinkErrors = unlinkArtifactFiles(id)
+      errors += unlinkErrors
+      if (unlinkErrors === 0) deleted += 1
+    }
+
+    return { scanned, matched, deleted, keptReferenced, keptPrivate, errors }
   }
 
   return {
@@ -329,6 +426,7 @@ export function createArtifactStore({
     readPage,
     offloadContent,
     pruneExpired,
+    pruneMatching,
   }
 }
 
@@ -370,6 +468,24 @@ export function install(rt) {
     })
   }
   store.pruneOrphans = pruneOrphans
+
+  function pruneForForget({ sessionId, date, fromMs, toMs, keyword, callerBotId } = {}) {
+    const referencedHandles = rt.hasTicketStore?.() ? rt.openTicketStore().listReferencedArtifacts() : []
+    const allowPrivateBotId = callerBotId !== undefined
+      ? (rt.botOf?.(callerBotId)?.private === true ? callerBotId : null)
+      : undefined
+    return store.pruneMatching({
+      sessionId,
+      date,
+      fromMs,
+      toMs,
+      keyword,
+      timeZone: rt.config?.timeZone,
+      referencedHandles,
+      allowPrivateBotId,
+    })
+  }
+  store.pruneForForget = pruneForForget
 
   ctx.on('tools/post-execute', async function offloadLargeToolOutput(exec, result, next) {
     const decision = await next()

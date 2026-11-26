@@ -210,3 +210,56 @@ test('pruneExpired and pruneOrphans delete expired unreferenced artifacts while 
   assert.equal(existsSync(join(freshTeam.rt.artifacts.dir, `${artOrphanOld.id}.json`)), false)
   assert.equal(freshTeam.rt.artifacts.readRaw(artTxtOnly.id), undefined)
 })
+
+test('pruneMatching and pruneForForget target orphan artifacts by session, date, time window, and keyword with privacy and ticket safety', (t) => {
+  const lazyTeam = startTeam(t)
+  const baseMs = Date.UTC(2026, 10, 26, 8, 0, 0)
+  const lazyArt = lazyTeam.rt.artifacts.save('session secret log entry', {
+    sessionId: 'm1',
+    botId: 'm1',
+    now: baseMs,
+  })
+  assert.deepEqual(
+    lazyTeam.rt.artifacts.pruneForForget({}),
+    { scanned: 0, matched: 0, deleted: 0, keptReferenced: 0, keptPrivate: 0, errors: 0 },
+    'empty criteria refuses deletion',
+  )
+  const lazyDel = lazyTeam.rt.artifacts.pruneForForget({ sessionId: 'm1', keyword: 'secret', callerBotId: 'm1' })
+  assert.equal(lazyDel.deleted, 1)
+  assert.equal(lazyTeam.rt.artifacts.readRaw(lazyArt.id), undefined)
+  assert.equal(existsSync(join(lazyTeam.home, 'tickets.sqlite')), false, 'pruneForForget must preserve lazy tickets.sqlite invariant')
+
+  const h = startTeam(t, { config: { timeZone: 'UTC' } })
+  const store = h.rt.openTicketStore()
+
+  const aSessionMatch = h.rt.artifacts.save('nginx gateway error log', { sessionId: 'm1', botId: 'm1', now: baseMs })
+  const aOtherSession = h.rt.artifacts.save('nginx gateway error log', { sessionId: 'b2', botId: 'b2', now: baseMs })
+  const aOtherDate = h.rt.artifacts.save('nginx gateway error log', { sessionId: 'm1', botId: 'm1', now: baseMs - 2 * 86_400_000 })
+  const aReferenced = h.rt.artifacts.save('nginx gateway ticket artifact', { sessionId: 'm1', botId: 'm1', now: baseMs })
+  const aPrivate = h.rt.artifacts.save('nginx private secret diary', { sessionId: 'm1', botId: 'p1', isPrivate: true, now: baseMs })
+
+  const tkt = store.create({ title: 'Nginx Fix', goal: 'Fix', ownerBotId: 'm1', createdByBotId: 'm1', artifacts: [aReferenced.handle] })
+  store.update(tkt.id, { status: 'done' })
+
+  const res = h.rt.artifacts.pruneForForget({
+    sessionId: 'm1',
+    date: '2026-11-26',
+    fromMs: baseMs - 1000,
+    toMs: baseMs + 1000,
+    keyword: 'nginx',
+    callerBotId: 'm1',
+  })
+  assert.deepEqual(res, {
+    scanned: 5,
+    matched: 2,
+    deleted: 1,
+    keptReferenced: 1,
+    keptPrivate: 1,
+    errors: 0,
+  })
+  assert.equal(h.rt.artifacts.readRaw(aSessionMatch.id), undefined)
+  assert.equal(h.rt.artifacts.readRaw(aOtherSession.id), 'nginx gateway error log')
+  assert.equal(h.rt.artifacts.readRaw(aOtherDate.id), 'nginx gateway error log')
+  assert.equal(h.rt.artifacts.readRaw(aReferenced.id), 'nginx gateway ticket artifact')
+  assert.equal(h.rt.artifacts.readRaw(aPrivate.id), 'nginx private secret diary')
+})
